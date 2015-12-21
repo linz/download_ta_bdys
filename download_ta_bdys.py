@@ -86,7 +86,6 @@ def main():
     logger = logging.getLogger()
 
     logger.info('Starting download TA boundaries')
-    
     db_host = None
     db_rolename = None
     db_port = None
@@ -145,38 +144,17 @@ def main():
     response = urllib2.urlopen(base_uri + '?f=json')
     capabilities = json.load(response)
     
-    latest_service = None
+    latest_layer = None
     latest_year = None
-    p = re.compile('((\d{4})\_Geographies)$', flags = re.UNICODE)
-    for service in capabilities['services']:
-        m = p.search(service['name'])
-        if m:
-            if not latest_year or m.group(2) > latest_year:
-                latest_year = int(m.group(2))
-                latest_service = m.group(1)
-    
-    logger.debug(base_uri + '/' + latest_service + '/MapServer?f=json')
-    response = urllib2.urlopen(base_uri + '/' + latest_service + '/MapServer?f=json')
-    capabilities = json.load(response)
-    
-    ta_layer = None
-    p = re.compile('^Territorial\sAuthorities\s\d{4}$', flags = re.UNICODE)
     for layer in capabilities['layers']:
-         m = p.search(layer['name'])
-         if m:
-            ta_layer = layer
-            break
-        
-    if not ta_layer:
+        m = re.match(r'^Territorial\sAuthorities\s(\d{4})$', layer['name'])
+        if m:
+            if not latest_year or int(m.group(1)) > latest_year:
+                latest_year = int(m.group(1))
+                latest_layer = str(layer['id'])
+    
+    if not latest_layer:
         logger.fatal('Could not find the TA layer in ' + base_uri)
-        sys.exit(1)
-    
-    feature_url = base_uri + '/' + latest_service + '/MapServer/' + str(ta_layer['id']) + \
-        '/query?f=json&where=1=1&returnGeometry=true&outSR=' + str(layer_output_srid)
-    
-    geojson_drv = ogr.GetDriverByName('GeoJSON')
-    if geojson_drv is None:
-        logger.fatal('Could not load the OGR GeoJSON driver')
         sys.exit(1)
     
     #
@@ -242,16 +220,7 @@ def main():
         
         # truncate data
         pg_ds.ExecuteSQL("TRUNCATE " + full_layer_name)
-    
-    geojs_ds = None
-    try:
-        geojs_ds = geojson_drv.Open(feature_url)
-    except Exception, e:
-        logger.fatal('Could not load fetch feature URL %s: %s' % (feature_url, str(e)))
-        sys.exit(1)
-    
-    input_lyr = geojs_ds.GetLayer(0)
-    
+        
     #
     # Create database table if it doesn't already exist.
     #
@@ -277,8 +246,100 @@ def main():
             logger.fatal('Can not create TA output table: %s' % (str(e)))
             sys.exit(1)
     
+    #
+    # Retrieve all features from the ArcGIS endpoint
+    #
+
+    layer_output_srs = osr.SpatialReference()
+    layer_output_srs.ImportFromEPSG(layer_output_srid)
+    geojson_drv = ogr.GetDriverByName('GeoJSON')
+
+    if geojson_drv is None:
+        logger.fatal('Could not load the OGR GeoJSON driver')
+        sys.exit(1)
+
+    # OGR < 2.0 doesn't support ArcGIS paging
+    if version_num < 2000000:
+
+        # Temp layer to store features
+        tmp_drv = ogr.GetDriverByName("MEMORY")
+        tmp_ds = tmp_drv.CreateDataSource('memDs')
+        tmp_opn = tmp_drv.Open('memDs',1)
+        input_lyr = tmp_ds.CreateLayer('tmpLyr',srs=layer_output_srs,geom_type=ogr.wkbMultiPolygon)
+
+        # Get a list of Object IDs
+        object_ids_uri = base_uri + '/' + str(latest_layer) + \
+                '/query?f=json&where=1=1&returnGeometry=False&outFields=objectid'
+
+        try:
+            response = urllib2.urlopen(object_ids_uri)
+        except Exception, e:
+            logger.fatal('Could open uri %s: %s' % (object_ids_uri, str(e)))
+            sys.exit(1)
+
+        try:
+            json_ids = json.load(response)
+        except Exception, e:
+            logger.fatal('Could load json from uri %s: %s' % (object_ids_uri, str(e)))
+            sys.exit(1)
+
+        geojs, tmp_feat_defn, feature, field_defn = None, None, None, None
+
+        # Retrieve each feature one by one
+        for feature in json_ids['features']:
+
+            object_id = feature['attributes']['OBJECTID']
+
+            feature_uri = base_uri + '/' + str(latest_layer) + \
+                '/query?f=json&returnGeometry=true&outSR=' + str(layer_output_srid) \
+                + '&objectIds=' + str(object_id)
+
+            try:
+                geojs = geojson_drv.Open(feature_uri)
+            except Exception, e:
+                logger.fatal('Could not read geojson from uri %s: %s' % (feature_uri, str(e)))
+                sys.exit(1)
+
+            try:
+                feature = geojs.GetLayer(0).GetNextFeature()
+            except Exception, e:
+                logger.fatal('Could get layer from geojson: %s' % (str(e)))
+                sys.exit(1)
+
+            if not tmp_feat_defn:
+                tmp_feat_defn = feature.GetDefnRef()
+                i = 0
+                while (i < tmp_feat_defn.GetFieldCount()):
+                   field_defn = tmp_feat_defn.GetFieldDefn(i)
+                   input_lyr.CreateField(field_defn)
+                   i = i + 1
+
+            input_lyr.CreateFeature(feature)
+
+    else:
+
+        layer_uri = base_uri + '/' + str(latest_layer) + \
+             '/query?f=json&where=1=1&returnGeometry=true&outSR=' + str(srid)
+
+        try:
+            geojs_ds = geojson_drv.Open(layer_uri)
+        except Exception, e:
+            logger.fatal('Could not read geojson from uri %s: %s' % (layer_uri, str(e)))
+            sys.exit(1)
+
+        try:
+            input_lyr = geojs_ds.GetLayer(0)
+        except Exception, e:
+            logger.fatal('Could get layer from geojson: %s' % (str(e)))
+            sys.exit(1)
+
+    if input_lyr.GetFeatureCount() < 1:
+        logger.fatal('No features found at URL %s: %s' \
+            % (base_uri + '/' + str(latest_layer), str(e)))
+        sys.exit(1)
+
     input_defn = input_lyr.GetLayerDefn()
-    p = re.compile('^TA\d{4}\_.+\_NAME$', flags = re.UNICODE)
+    p = re.compile('^TA' + str(latest_year) + '.+NAME$', flags = re.UNICODE)
     ta_name_field = None
     for i in range( input_defn.GetFieldCount() ):
         field = input_defn.GetFieldDefn( i )
@@ -288,7 +349,7 @@ def main():
     if not ta_name_field:
         logger.fatal("Can not find TA name field")
         sys.exit(1)
-    
+
     gdal.SetConfigOption('PG_USE_COPY', 'YES')
     
     #
@@ -312,8 +373,12 @@ def main():
         output_feature.Destroy()
         input_feature = input_lyr.GetNextFeature()
     input_feature = None
-    output_lyr.CommitTransaction()
-    
+
+    try: # TODO: sometimes get an 'General OGR error' while committing?
+        output_lyr.CommitTransaction()
+    except Exception, e:
+        logger.debug("Ignoring commit error: " + str(e))
+
     pg_ds.ExecuteSQL("ANALYSE " + full_layer_name)
     pg_ds.ExecuteSQL("COMMENT ON TABLE " + full_layer_name + " IS '" + str(latest_year) + "'")
     
