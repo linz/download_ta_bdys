@@ -39,11 +39,11 @@ if version_num < 1110200:
 
 # if GDAL 2.0 or higher then:
 #     use retry option for HTTP 500 timeout issues
-#     set feature paging to a small number
+#     set feature paging to on 
 if version_num >= 2000000:
     gdal.SetConfigOption('GDAL_HTTP_RETRY_DELAY', '10')
     gdal.SetConfigOption('GDAL_HTTP_MAX_RETRY', '5')
-    gdal.SetConfigOption('FEATURE_SERVER_PAGING ', '10')
+    gdal.SetConfigOption('FEATURE_SERVER_PAGING ', 'YES')
 
 # make sure gdal exceptions are not silent
 gdal.UseExceptions()
