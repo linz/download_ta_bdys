@@ -98,6 +98,7 @@ def main():
     create_grid = False
     grid_res = 0.05
     shift_geometry = False
+    force_update = False
     
     base_uri = parser.get('source', 'base_uri')
     db_name = parser.get('database', 'name')
@@ -124,6 +125,8 @@ def main():
         grid_res = parser.getfloat('layer', 'grid_res')
     if parser.has_option('layer', 'shift_geometry'):
         shift_geometry = parser.getboolean('layer', 'shift_geometry')
+    if parser.has_option('layer', 'force_update'):
+        force_update = parser.getboolean('layer', 'force_update')
     
     try:
         output_srs = osr.SpatialReference()
@@ -215,7 +218,8 @@ def main():
             if current_version <= latest_year:
                 logger.info("TA layer does not need to be updated (current version " + \
                     str(current_version) + ")")
-                sys.exit(0)
+                if not force_update:
+                    sys.exit(0)
         pg_ds.ReleaseResultSet(sql_lyr)
         
         # truncate data
@@ -257,10 +261,49 @@ def main():
     if geojson_drv is None:
         logger.fatal('Could not load the OGR GeoJSON driver')
         sys.exit(1)
+    
+    # ArcGIS server capabilities
+    capabilities_uri = base_uri + '/' + str(latest_layer) + '?f=json&pretty=true'
 
-    # OGR < 2.0 doesn't support ArcGIS paging
-    if version_num < 2000000:
+    try:
+        response = urllib2.urlopen(capabilities_uri)
+    except Exception, e:
+        logger.fatal('Could open uri %s: %s' % (capabilities_uri, str(e)))
+        sys.exit(1)
 
+    try:
+        capabilities = json.load(response)
+    except Exception, e:
+        logger.fatal('Could load json from uri %s: %s' % (capabilities_uri, str(e)))
+        sys.exit(1)
+    
+    # Get some of the capabilities
+    server_version = capabilities['currentVersion']
+    server_pagination = capabilities['advancedQueryCapabilities']['supportsPagination']
+    
+    logger.debug('Your OGR version is: ' + str(version_num))
+    logger.debug('Stats NZ ArcGIS server version is : ' + str(server_version))
+    logger.debug('Stats NZ ArcGIS server pagination flag is : ' + str(server_pagination))
+
+    # Use OGR to do paging if version 2.x and server supports paging 
+    # otherwise loop through each feature 
+    if version_num >= 2000000 and server_version >= 10.1 and str(server_pagination).lower() == 'true':
+        layer_uri = base_uri + '/' + str(latest_layer) + \
+             '/query?f=json&where=1=1&returnGeometry=true&outSR=' + str(srid)
+
+        try:
+            geojs_ds = geojson_drv.Open(layer_uri)
+        except Exception, e:
+            logger.fatal('Could not read geojson from uri %s: %s' % (layer_uri, str(e)))
+            sys.exit(1)
+
+        try:
+            input_lyr = geojs_ds.GetLayer(0)
+        except Exception, e:
+            logger.fatal('Could get layer from geojson: %s' % (str(e)))
+            sys.exit(1)
+
+    else:
         # Temp layer to store features
         tmp_drv = ogr.GetDriverByName("MEMORY")
         tmp_ds = tmp_drv.CreateDataSource('memDs')
@@ -285,7 +328,8 @@ def main():
 
         geojs, tmp_feat_defn, feature, field_defn = None, None, None, None
 
-        # Retrieve each feature one by one
+        # Retrieve features one by one
+        # TODO: retrieve features ten at time to reduce web requests
         for feature in json_ids['features']:
 
             object_id = feature['attributes']['OBJECTID']
@@ -315,23 +359,6 @@ def main():
                    i = i + 1
 
             input_lyr.CreateFeature(feature)
-
-    else:
-
-        layer_uri = base_uri + '/' + str(latest_layer) + \
-             '/query?f=json&where=1=1&returnGeometry=true&outSR=' + str(srid)
-
-        try:
-            geojs_ds = geojson_drv.Open(layer_uri)
-        except Exception, e:
-            logger.fatal('Could not read geojson from uri %s: %s' % (layer_uri, str(e)))
-            sys.exit(1)
-
-        try:
-            input_lyr = geojs_ds.GetLayer(0)
-        except Exception, e:
-            logger.fatal('Could get layer from geojson: %s' % (str(e)))
-            sys.exit(1)
 
     if input_lyr.GetFeatureCount() < 1:
         logger.fatal('No features found at URL %s: %s' \
