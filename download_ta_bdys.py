@@ -37,10 +37,13 @@ version_num = int(gdal.VersionInfo('VERSION_NUM'))
 if version_num < 1110200:
     sys.exit('ERROR: Python bindings of GDAL 1.11.2 or later required')
 
-# if GDAL 2.0 or higher then use retry option for HTTP 500 timeout issues
+# if GDAL 2.0 or higher then:
+#     use retry option for HTTP 500 timeout issues
+#     set feature paging to a small number
 if version_num >= 2000000:
     gdal.SetConfigOption('GDAL_HTTP_RETRY_DELAY', '10')
     gdal.SetConfigOption('GDAL_HTTP_MAX_RETRY', '5')
+    gdal.SetConfigOption('FEATURE_SERVER_PAGING ', '10')
 
 # make sure gdal exceptions are not silent
 gdal.UseExceptions()
@@ -278,8 +281,13 @@ def main():
         sys.exit(1)
     
     # Get some of the capabilities
-    server_version = capabilities['currentVersion']
-    server_pagination = capabilities['advancedQueryCapabilities']['supportsPagination']
+    server_version = 0
+    server_pagination = False
+    if 'currentVersion' in capabilities.keys():
+        server_version = capabilities['currentVersion']
+    if 'advancedQueryCapabilities' in capabilities.keys():
+        if 'supportsPagination' in capabilities['advancedQueryCapabilities'].keys():
+            server_pagination = capabilities['advancedQueryCapabilities']['supportsPagination']
     
     logger.debug('Your OGR version is: ' + str(version_num))
     logger.debug('Stats NZ ArcGIS server version is : ' + str(server_version))
@@ -287,7 +295,7 @@ def main():
 
     # Use OGR to do paging if version 2.x and server supports paging 
     # otherwise loop through each feature 
-    if version_num >= 2000000 and server_version >= 10.1 and str(server_pagination).lower() == 'true':
+    if version_num >= 2000000 and server_version >= 10.3 and str(server_pagination).lower() == 'true':
         layer_uri = base_uri + '/' + str(latest_layer) + \
              '/query?f=json&where=1=1&returnGeometry=true&outSR=' + str(srid)
 
