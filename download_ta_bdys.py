@@ -19,6 +19,7 @@ import string
 import socket
 import urllib2
 import logging.config
+import math
 
 from optparse import OptionParser
 from ConfigParser import SafeConfigParser
@@ -68,25 +69,29 @@ def shift_geom ( geom ):
             geom.SetPoint( i, x, y, z )
     return
 
+def round_up(num, divisor):
+    return int((math.ceil(num / divisor) + 1) * divisor)
+
 def main():
-    
+
     usage = "usage: %prog config_file.ini"
     parser = OptionParser(usage=usage)
     (cmd_opt, args) = parser.parse_args()
-       
+
     if len(args) == 1:
         config_files = [args[0]]
     else:
         config_files = ['download_ta_bdys.ini']
-    
+
     parser = SafeConfigParser()
     found = parser.read(config_files)
     if not found:
         sys.exit('Could not load config ' + config_files[0] )
-    
+
     # set up logging
     logging.config.fileConfig(config_files[0], defaults={ 'hostname': socket.gethostname() })
     logger = logging.getLogger()
+
 
     logger.info('Starting download TA boundaries')
     db_host = None
@@ -102,11 +107,14 @@ def main():
     grid_res = 0.05
     shift_geometry = False
     force_update = False
-    
+    page_size = 10
+
     base_uri = parser.get('source', 'base_uri')
+    if parser.has_option('source', 'page_size'):
+        page_size = parser.getint('source', 'page_size')
     db_name = parser.get('database', 'name')
     db_schema = parser.get('database', 'schema')
-    
+
     if parser.has_option('database', 'rolename'):
         db_rolename = parser.get('database', 'rolename')
     if parser.has_option('database', 'host'):
@@ -117,7 +125,7 @@ def main():
         db_user = parser.get('database', 'user')
     if parser.has_option('database', 'password'):
         db_pass = parser.get('database', 'password')
-        
+
     layer_name = parser.get('layer', 'name')
     layer_geom_column = parser.get('layer', 'geom_column')
     if parser.has_option('layer', 'output_srid'):
@@ -130,26 +138,26 @@ def main():
         shift_geometry = parser.getboolean('layer', 'shift_geometry')
     if parser.has_option('layer', 'force_update'):
         force_update = parser.getboolean('layer', 'force_update')
-    
+
     try:
         output_srs = osr.SpatialReference()
         output_srs.ImportFromEPSG(layer_output_srid)
     except:
         logger.fatal("Output SRID %s is not valid" % (layer_output_srid))
         sys.exit(1)
-    
+
     if create_grid and not grid_res > 0:
         logger.fatal("Grid resolution must be greater than 0")
         sys.exit(1)
-        
+
     #
     # Determine TA layer and its year from REST service
     #
-    
+
     logger.debug(base_uri + '?f=json')
     response = urllib2.urlopen(base_uri + '?f=json')
     capabilities = json.load(response)
-    
+
     latest_layer = None
     latest_year = None
     for layer in capabilities['layers']:
@@ -158,20 +166,20 @@ def main():
             if not latest_year or int(m.group(1)) > latest_year:
                 latest_year = int(m.group(1))
                 latest_layer = str(layer['id'])
-    
+
     if not latest_layer:
         logger.fatal('Could not find the TA layer in ' + base_uri)
         sys.exit(1)
-    
+
     #
     # Connect to the PostgreSQL database
     #
-    
+
     pg_drv = ogr.GetDriverByName('PostgreSQL')
     if pg_drv is None:
         logger.fatal('Could not load the OGR PostgreSQL driver')
         sys.exit(1)
-    
+
     pg_uri = 'PG:dbname=' + db_name
     if db_host:
         pg_uri = pg_uri + ' host=' +  db_host
@@ -181,28 +189,28 @@ def main():
         pg_uri = pg_uri + ' user=' +  db_user
     if db_pass:
         pg_uri = pg_uri + ' password=' +  db_pass
-    
+
     pg_ds = None
     try:
         pg_ds = pg_drv.Open(pg_uri, update = 1)
     except Exception, e:
         logger.fatal("Can't open PG output database: " + str(e))
         sys.exit(1)
-    
+
     if db_rolename:
        pg_ds.ExecuteSQL("SET ROLE " + db_rolename)
-    
+
     #
     # Check the current database TA table year. Only continue if data is old.
     #
-    
+
     output_lyr = None
     full_layer_name = db_schema + '.' + layer_name
     try:
         output_lyr = pg_ds.GetLayerByName(full_layer_name)
     except:
         logger.debug(full_layer_name + ' does not exist')
-    
+
     if output_lyr:
         sql = """SELECT
                     description
@@ -213,7 +221,7 @@ def main():
                  WHERE
                     nspname='%s' and
                     relname = '%s' """ % (db_schema, layer_name)
-        
+
         sql_lyr = pg_ds.ExecuteSQL(sql)
         feat = sql_lyr.GetNextFeature()
         if feat:
@@ -224,19 +232,19 @@ def main():
                 if not force_update:
                     sys.exit(0)
         pg_ds.ReleaseResultSet(sql_lyr)
-        
+
         # truncate data
         pg_ds.ExecuteSQL("TRUNCATE " + full_layer_name)
-        
+
     #
     # Create database table if it doesn't already exist.
     #
-    
+
     if not output_lyr:
         create_opts = ['GEOMETRY_NAME='+layer_geom_column]
         if db_schema:
             create_opts.append('SCHEMA=' + db_schema)
-        
+
         try:
             output_lyr = pg_ds.CreateLayer(
                 full_layer_name,
@@ -247,12 +255,12 @@ def main():
             name_field = ogr.FieldDefn('name', ogr.OFTString)
             name_field.SetWidth(100)
             output_lyr.CreateField(name_field)
-            
+
             pg_ds.ExecuteSQL("GRANT SELECT ON TABLE " + full_layer_name + " TO public")
         except Exception, e:
             logger.fatal('Can not create TA output table: %s' % (str(e)))
             sys.exit(1)
-    
+
     #
     # Retrieve all features from the ArcGIS endpoint
     #
@@ -264,7 +272,7 @@ def main():
     if geojson_drv is None:
         logger.fatal('Could not load the OGR GeoJSON driver')
         sys.exit(1)
-    
+
     # ArcGIS server capabilities
     capabilities_uri = base_uri + '/' + str(latest_layer) + '?f=json&pretty=true'
 
@@ -279,7 +287,7 @@ def main():
     except Exception, e:
         logger.fatal('Could load json from uri %s: %s' % (capabilities_uri, str(e)))
         sys.exit(1)
-    
+
     # Get some of the capabilities
     server_version = 0
     server_pagination = False
@@ -288,35 +296,72 @@ def main():
     if 'advancedQueryCapabilities' in capabilities.keys():
         if 'supportsPagination' in capabilities['advancedQueryCapabilities'].keys():
             server_pagination = capabilities['advancedQueryCapabilities']['supportsPagination']
-    
-    logger.debug('Your OGR version is: ' + str(version_num))
-    logger.debug('Stats NZ ArcGIS server version is : ' + str(server_version))
-    logger.debug('Stats NZ ArcGIS server pagination flag is : ' + str(server_pagination))
+    if 'displayField' in capabilities.keys():
+        display_field = capabilities['displayField']
+
+    # Feature count
+    count_uri = base_uri + '/' + str(latest_layer) + \
+             '/query?f=json&where=1=1&returnCountOnly=true'
+    try:
+        count_response = urllib2.urlopen(count_uri)
+    except Exception, e:
+        logger.fatal('Could open uri %s: %s' % (count_uri, str(e)))
+        sys.exit(1)
+
+    try:
+       count_json = json.load(count_response)
+       feat_count = int(count_json['count'])
+    except Exception, e:
+       logger.warning('Could not get feature count for uri %s: %s' % (count_uri, str(e)))
+
+    logger.info('Your OGR version is: ' + str(version_num))
+    logger.info('Stats NZ ArcGIS server version is : ' + str(server_version))
+    logger.info('Stats NZ ArcGIS server pagination flag is : ' + str(server_pagination))
+
+    # Temp layer to store features
+    tmp_drv = ogr.GetDriverByName("MEMORY")
+    tmp_ds = tmp_drv.CreateDataSource('memDs')
+    tmp_opn = tmp_drv.Open('memDs',1)
+    input_lyr = tmp_ds.CreateLayer('tmpLyr',srs=layer_output_srs,geom_type=ogr.wkbMultiPolygon)
 
     # Use OGR to do paging if version 2.x and server supports paging 
-    # otherwise loop through each feature 
-    if version_num >= 2000000 and server_version >= 10.3 and str(server_pagination).lower() == 'true':
-        layer_uri = base_uri + '/' + str(latest_layer) + \
-             '/query?f=json&where=1=1&returnGeometry=true&outSR=' + str(srid)
+    if version_num >= 2000000 \
+        and server_version >= 10.3  \
+        and str(server_pagination).lower() == 'true' \
+        and feat_count \
+        and display_field:
 
-        try:
-            geojs_ds = geojson_drv.Open(layer_uri)
-        except Exception, e:
-            logger.fatal('Could not read geojson from uri %s: %s' % (layer_uri, str(e)))
-            sys.exit(1)
+        for i in range(feat_count):
 
-        try:
-            input_lyr = geojs_ds.GetLayer(0)
-        except Exception, e:
-            logger.fatal('Could get layer from geojson: %s' % (str(e)))
-            sys.exit(1)
+            offset = round_up(i, page_size)
 
+            page_uri = base_uri + '/' + str(latest_layer) + \
+                 '/query?f=json&where=1=1&returnGeometry=true&outSR=' + str(srid) + \
+                 'orderByFields=' + display_field + '&resultOffset=' + offset + '&resultRecordCount=' + feat_count 
+
+            try:
+                geojs = geojson_drv.Open(page_uri)
+            except Exception, e:
+                logger.fatal('Could not read geojson from uri %s: %s' % (page_uri, str(e)))
+                sys.exit(1)
+
+            try:
+                geojs_lyr = geojs.GetLayer(0)
+            except Exception, e:
+                logger.fatal('Could not get layer from geojson: %s' % (str(e)))
+                sys.exit(1)
+
+            for feature in geojs_lyr:
+                if not tmp_feat_defn:
+                    tmp_feat_defn = feature.GetDefnRef()
+                    for i in range(tmp_feat_defn.GetFieldCount()):
+                       field_defn = tmp_feat_defn.GetFieldDefn(i)
+                       input_lyr.CreateField(field_defn)
+
+                input_lyr.CreateFeature(feature)
+
+    # Otherwise use filtering to do paging
     else:
-        # Temp layer to store features
-        tmp_drv = ogr.GetDriverByName("MEMORY")
-        tmp_ds = tmp_drv.CreateDataSource('memDs')
-        tmp_opn = tmp_drv.Open('memDs',1)
-        input_lyr = tmp_ds.CreateLayer('tmpLyr',srs=layer_output_srs,geom_type=ogr.wkbMultiPolygon)
 
         # Get a list of Object IDs
         object_ids_uri = base_uri + '/' + str(latest_layer) + \
@@ -334,44 +379,65 @@ def main():
             logger.fatal('Could load json from uri %s: %s' % (object_ids_uri, str(e)))
             sys.exit(1)
 
-        geojs, tmp_feat_defn, feature, field_defn = None, None, None, None
+        # Build page requests by getting lists of ObjectIDs 
+        pages = []
+        for i in range(len(json_ids['features'])):
 
-        # Retrieve features one by one
-        # TODO: retrieve features ten at time to reduce web requests
-        for feature in json_ids['features']:
+            offset = round_up(i, page_size)
 
-            object_id = feature['attributes']['OBJECTID']
+            # Only proceed once for each page
+            if i == (offset - page_size):
+                json_features = json_ids['features'][i:offset]
 
-            feature_uri = base_uri + '/' + str(latest_layer) + \
-                '/query?f=json&returnGeometry=true&outSR=' + str(layer_output_srid) \
-                + '&objectIds=' + str(object_id)
+                # Get all remaining features for final page
+                if not json_features: 
+                    json_features = json_ids['features'][i:]
 
-            try:
-                geojs = geojson_drv.Open(feature_uri)
-            except Exception, e:
-                logger.fatal('Could not read geojson from uri %s: %s' % (feature_uri, str(e)))
+                pages.append(json_features)
+
+        # Make the page requests to server
+        tmp_feat_defn = None
+        for page in pages:
+
+            object_ids = []
+            for json_feat in page:
+                object_ids.append(str(json_feat['attributes']['OBJECTID']))
+
+            if object_ids:
+                page_uri = base_uri + '/' + str(latest_layer) + \
+                    '/query?f=json&returnGeometry=true&outSR=' + str(layer_output_srid) \
+                    + '&objectIds=' + ','.join(object_ids)
+            else:
+                logger.fatal('Could not retrieve ObjectIDs %s' % (str(e)))
                 sys.exit(1)
 
             try:
-                feature = geojs.GetLayer(0).GetNextFeature()
+                geojs = geojson_drv.Open(page_uri)
             except Exception, e:
-                logger.fatal('Could get layer from geojson: %s' % (str(e)))
+                logger.fatal('Could not read geojson from uri %s: %s' % (page_uri, str(e)))
                 sys.exit(1)
 
-            if not tmp_feat_defn:
-                tmp_feat_defn = feature.GetDefnRef()
-                i = 0
-                while (i < tmp_feat_defn.GetFieldCount()):
-                   field_defn = tmp_feat_defn.GetFieldDefn(i)
-                   input_lyr.CreateField(field_defn)
-                   i = i + 1
+            try:
+                geojs_lyr = geojs.GetLayer(0)
+            except Exception, e:
+                logger.fatal('Could not get layer from geojson: %s' % (str(e)))
+                sys.exit(1)
 
-            input_lyr.CreateFeature(feature)
+            for feature in geojs_lyr:
+                if not tmp_feat_defn:
+                    tmp_feat_defn = feature.GetDefnRef()
+                    for i in range(tmp_feat_defn.GetFieldCount()):
+                       field_defn = tmp_feat_defn.GetFieldDefn(i)
+                       input_lyr.CreateField(field_defn)
+
+                input_lyr.CreateFeature(feature)
 
     if input_lyr.GetFeatureCount() < 1:
         logger.fatal('No features found at URL %s: %s' \
             % (base_uri + '/' + str(latest_layer), str(e)))
         sys.exit(1)
+    else:
+        logger.info('Successfully retrieved feature count is : ' + str(input_lyr.GetFeatureCount()))
 
     input_defn = input_lyr.GetLayerDefn()
     p = re.compile('^TA' + str(latest_year) + '.+NAME$', flags = re.UNICODE)
@@ -386,11 +452,11 @@ def main():
         sys.exit(1)
 
     gdal.SetConfigOption('PG_USE_COPY', 'YES')
-    
+
     #
     # Copy data from REST Service to PostgreSQL database
     #
-    
+
     output_defn = output_lyr.GetLayerDefn()
     input_lyr.ResetReading()
     input_feature = input_lyr.GetNextFeature()
@@ -416,11 +482,11 @@ def main():
 
     pg_ds.ExecuteSQL("ANALYSE " + full_layer_name)
     pg_ds.ExecuteSQL("COMMENT ON TABLE " + full_layer_name + " IS '" + str(latest_year) + "'")
-    
+
     #
     # Create TA grid index if configured
     #
-    
+
     if create_grid:
         sql = "SELECT create_table_polygon_grid('%s', '%s', '%s', %g, %g) as result" \
               % (db_schema, layer_name, layer_geom_column, grid_res, grid_res)
@@ -433,7 +499,7 @@ def main():
         except Exception, e:
             logger.fatal("Failed to create grid layer: " + str(e))
             sys.exit(1)
-    
+
     logger.info("TA layer has been updated to version " + str(latest_year))
     sys.exit(0)
 
