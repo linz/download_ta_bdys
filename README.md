@@ -5,14 +5,28 @@ This LINZ software provides a script to download and update [Statistics New Zeal
 ## Configuration setup
 Download the code, create a config file or customise the included download_ta_bdy.ini config file. The following configuration options are important to setup:
 
-1. In the database section of the config file set the output PostgreSQL database name.
+1. Set up the Stats NZ server URL
+
+    ~~~ ini
+    [source]
+    base_uri = http://maps.stats.govt.nz/wss/service/arcgis1/guest/Boundaries/Local_government/MapServer
+    ~~~
+
+2. Specify how many features to retrieve per request. If it times out or you get errors try a smaller number
+
+    ~~~ ini
+    [source]
+    page_size = 10
+    ~~~ 
+
+3. In the database section of the config file set the output PostgreSQL database name.
   
     ~~~ ini
     [database]
     name = bde_db
     ~~~
     
-2. Set the output schema name and any required connection credentials. If not schema name is set then the 'public' schema will be used
+4. Set the output schema name and any required connection credentials. If not schema name is set then the 'public' schema will be used
    
     ~~~ ini
     name = bde_db
@@ -22,7 +36,7 @@ Download the code, create a config file or customise the included download_ta_bd
     schema = my_schema
     ~~~
     
-3. Set the output TA layer name, output coordinate system ([EPSG id](http://spatialreference.org)) and if you want to shift longitudes to 0-360
+5. Set the output TA layer name, output coordinate system ([EPSG id](http://spatialreference.org)) and if you want to shift longitudes to 0-360
     
     ~~~ ini
     [layer]
@@ -31,15 +45,22 @@ Download the code, create a config file or customise the included download_ta_bd
     shift_geometry = True
     ~~~
     
-4. Optionally create a grid index once the TA boundary layer has been created. grid_res is X & Y resolution (in coordinate system units) of the grid to be created
+6. Optionally create a grid index once the TA boundary layer has been created. grid_res is X & Y resolution (in coordinate system units) of the grid to be created
 
     ~~~ ini
     [layer]
     grid_res = 0.05
     shift_geometry = True
     ~~~
+
+7. Optionally set it to update the data every time regardless of whether Stat has released a new version. Useful for testing
+
+    ~~~ ini
+    [layer]
+    force_update = True
+    ~~~
     
-5. Setup the logging parameters. The most important setting is to setup the fileHandler file logging path
+8. Setup the logging parameters. The most important setting is to setup the fileHandler file logging path
 
     ~~~ ini
     [handler_fileHandler]
@@ -49,7 +70,7 @@ Download the code, create a config file or customise the included download_ta_bd
     args=('/path/to/mylogfile.log', 'w')
     ~~~
     
-6. Also if you want to email errors from the script to an email account then emailHandler needs to be configured
+9. Also if you want to email errors from the script to an email account then emailHandler needs to be configured
 
     ~~~ ini
     [handler_emailHandler]
