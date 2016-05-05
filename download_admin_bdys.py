@@ -24,6 +24,27 @@ import socket,time
 from zipfile import ZipFile
 from paramiko import Transport, SFTPClient
 
+
+from twisted.internet import reactor
+from twisted.internet.defer import Deferred
+
+from twisted.conch.ssh.common import NS
+from twisted.conch.scripts.cftp import ClientOptions
+from twisted.conch.ssh.filetransfer import FileTransferClient
+from twisted.conch.client.connect import connect
+from twisted.conch.client.default import SSHUserAuthClient, verifyHostKey
+from twisted.conch.ssh.connection import SSHConnection
+from twisted.conch.ssh.channel import SSHChannel
+
+from twisted.python.log import startLogging, err
+
+
+from subprocess import Popen,PIPE,check_output
+
+
+import pexpect
+
+
 from optparse import OptionParser
 from ConfigParser import SafeConfigParser
 
@@ -210,35 +231,18 @@ class ConfReader(object):
 
 class meshblocks(object):
     
-    f2t = {'Stats_MB_WKT.csv':'meshblock', 'Stats_Meshblock_concordance_WKT.csv':'meshblock_concordance', 'Stats_TA_WKT.csv':'territorial_authority'}
+    f2t = {'Stats_MB_WKT.csv':'meshblock', 'Stats_sudo Meshblock_concordance_WKT.csv':'meshblock_concordance', 'Stats_TA_WKT.csv':'territorial_authority'}
     enc = 'utf-8-sig'
     
     def __init__(self,conf,db): 
         self.db = db
         self.conf = conf
-        self.insert(self.fetch())
-        
-    def fetch(self):
-        
-        transport = Transport((self.conf.meshblock_ftphost,int(self.conf.meshblock_ftpport)))
-        transport.connect(hostkey=None, username=self.conf.meshblock_ftpuser, password=self.conf.meshblock_ftppass, pkey=None)
-                    #gss_host=None, gss_auth=False, gss_kex=False, gss_deleg_creds=True)# not in this version
-        sftp = SFTPClient.from_transport(transport) 
-        for fname in sftp.listdir('.'):
-            fmatch = re.match(self.conf.meshblock_ftpregex,fname)
-            if fmatch: 
-                localfile = fmatch.group(0)
-                break
-        if not localfile: sys.exit(1)
-        
-        localpath = '{}/{}'.format(self.conf.meshblock_localpath,localfile)
-        remotepath = '{}/{}'.format(self.conf.meshblock_ftppath,localfile)
-        print (remotepath,'->',localpath)
-        sftp.get(remotepath, localpath)
-                
-        sftp.close()
-        transport.close()
-        return localpath
+        #self.sftp = paramikosftp(conf) #kex error for paramiko_ver < 1.15
+        #self.sftp = twistedsftp(conf) #kex error all versions
+        #self.sftp = shellsftp(conf) #password sending problems
+        self.sftp = pexpectsftp(conf)
+        self.file = self.sftp.fetch()
+        self.insert(self.file)
         
     def insert(self,mb):
         self.db.connect()
@@ -331,6 +335,171 @@ class nzfslocalities(object):
             logger.fatal('Can not populate NZ_Localities output table {}'.format(e))
             sys.exit(1)
         
+class paramikosftp(object):
+    
+    def __init__(self,conf):
+        self.conf = conf
+        
+    def fetch(self):
+        
+        transport = Transport((self.conf.meshblock_ftphost,int(self.conf.meshblock_ftpport)))
+        transport.connect(hostkey=None, username=self.conf.meshblock_ftpuser, password=self.conf.meshblock_ftppass, pkey=None)
+                    #gss_host=None, gss_auth=False, gss_kex=False, gss_deleg_creds=True)# not in this version
+        sftp = SFTPClient.from_transport(transport) 
+        localfile = None
+        for fname in sftp.listdir(self.conf.meshblock_ftppath):
+            fmatch = re.match(self.conf.meshblock_ftpregex,fname)
+            if fmatch: 
+                localfile = fmatch.group(0)
+                break
+        if not localfile: sys.exit(1)
+        
+        localpath = '{}/{}'.format(self.conf.meshblock_localpath,localfile)
+        remotepath = '{}/{}'.format(self.conf.meshblock_ftppath,localfile)
+        print (remotepath,'->',localpath)
+        sftp.get(remotepath, localpath)
+                
+        sftp.close()
+        transport.close()
+        return localpath
+    
+class twistedsftp(object):
+    #Failure: twisted.conch.error.ConchError: ("couldn't match all kex parts", 3)
+    class SFTPSession(SSHChannel):
+        name = 'session'
+    
+        def channelOpen(self, whatever):
+            d = self.conn.sendRequest(
+                self, 'subsystem', NS('sftp'), wantReply=True)
+            d.addCallbacks(self._cbSFTP)
+    
+    
+        def _cbSFTP(self, result):
+            client = FileTransferClient()
+            client.makeConnection(self)
+            self.dataReceived = client.dataReceived
+            self.conn._sftp.callback(client)
+    
+    
+    
+    class SFTPConnection(SSHConnection):
+        def serviceStarted(self):
+            self.openChannel(SFTPSession())
+            
+            
+    def sftp(self,user, host, port):
+        options = ClientOptions()
+        options['host'] = host
+        options['port'] = port
+        conn = TwistedSFTP.SFTPConnection()
+        conn._sftp = Deferred()
+        auth = SSHUserAuthClient(user, options, conn)
+        connect(host, port, options, verifyHostKey, auth)
+        return conn._sftp
+
+    
+    def __init__(self,conf):    
+
+        user = conf.meshblock_ftpuser
+        host = conf.meshblock_ftphost
+        port = int(conf.meshblock_ftpport)
+        self.d = self.sftp(user, host, port)
+        self.run()
+        
+    
+    def fetch(self):
+        self.d.addCallback(self.get)
+        self.d.addErrback(err, "Problem with SFTP transfer")
+        self.d.addCallback(lambda ignored: reactor.stop())
+        reactor.run()
+        
+    @staticmethod
+    def get(client):
+        d = client.listDirectory('.')
+#         def cbDir(ignored):
+#             print 'listed directory'
+#         d.addCallback(cbDir)
+#         return d
+
+    def run(self):
+        self.d.addCallback(self.get)
+        self.d.addErrback(err, "Problem with SFTP transfer")
+        self.d.addCallback(lambda ignored: reactor.stop())
+        reactor.run()
+
+class shellsftp(object):
+    
+    def __init__(self,conf):
+        self.conf = conf
+        
+    def fetch(self):
+        #ret = subprocess.check_output(['sshpass','-p',self.conf.meshblock_ftppass,'sftp','{}@{}'.format(self.conf.meshblock_ftpuser,self.conf.meshblock_ftphost)])
+        #if ret == 'Password':
+        #    ret = subprocess.check_output([self.conf.meshblock_ftppass])
+        #else: print 'username/host combo failed',ret
+        #listing = subprocess.check_output(['ls',self.conf.meshblock_ftppath])
+        #print listing
+        target = '{}@{}:{}'.format(self.conf.meshblock_ftpuser,self.conf.meshblock_ftphost,self.conf.meshblock_ftppath)
+        proc = Popen(['sftp',target],stdin=PIPE,stdout=PIPE)
+        proc.stdin.write(self.conf.meshblock_ftppass)
+        #proc = check_output('sftp '+target,shell=True)
+        print proc
+        print proc.communicate()
+        proc.communicate(input=self.conf.meshblock_ftppass+'\n')
+        print 2,proc
+        print 9
+        
+class PExpectException(Exception):pass
+class pexpectsftp(object):  
+      
+    def __init__(self,conf):
+        self.conf = conf
+        self.target = '{}@{}:{}'.format(self.conf.meshblock_ftpuser,self.conf.meshblock_ftphost,self.conf.meshblock_ftppath)
+        self.opts = ['-o','PasswordAuthentication=yes',self.target]
+        
+    def fetch(self):
+        localpath = None
+        prompt = 'sftp> '
+        get_timeout = 60.0
+        sftp = pexpect.spawn('sftp',self.opts)
+        try:
+            if sftp.expect('(?i)password:')==0:
+                sftp.sendline(self.conf.meshblock_ftppass)
+                if sftp.expect(prompt) == 0:
+                    sftp.sendline('ls')
+                    if sftp.expect(prompt) == 0:
+                        for fname in sftp.before.split()[1:]:
+                            fmatch = re.match(self.conf.meshblock_ftpregex,fname)
+                            if fmatch: 
+                                localfile = fmatch.group(0)
+                                break
+                        if not localfile: 
+                            raise PExpectException('Cannot find matching file pattern')
+                    else:
+                        raise PExpectException('Unable to access or empty directory at {}'.format(self.conf.meshblock_ftppath))
+                    localpath = '{}/{}'.format(self.conf.meshblock_localpath,localfile)
+                    remotepath = '{}/{}'.format(self.conf.meshblock_ftppath,localfile)
+                    print (remotepath,'->',localpath)
+                    
+                    sftp.sendline('get {}'.format(localfile))
+                    if sftp.expect(prompt,get_timeout) != 0:
+                        raise PExpectException('Cannot retrieve file, {}'.format(remotepath))
+                    os.rename('./{}'.format(localfile),localpath)
+                else: 
+                    raise PExpectException('Password authentication failed')  
+            else:
+                raise PExpectException('Cannot initiate session using {}'.format(selt.opts))  
+                
+        except pexpect.EOF:
+            raise PExpectException('End-Of-File received attempting connect')  
+        except pexpect.TIMEOUT:
+            raise PExpectException('Connection timeout occurred')  
+        finally:
+            sftp.sendline('bye')
+            sftp.close()
+            
+        return localpath
+
     
 '''
 TODO
@@ -341,6 +510,7 @@ def main():
     c = ConfReader()
     d = DatabaseConn(c)
         
+    
     #taboundaries(c)
     meshblocks(c,d)
     nzfslocalities(c,d)
