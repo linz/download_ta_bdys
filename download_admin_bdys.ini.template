@@ -4,11 +4,11 @@ base_uri = http://maps.stats.govt.nz/wss/service/arcgis1/guest/Boundaries
 [database]
 name = linz_db
 rolename = bde_dba
-;host = localhost
-;user = username
-;port = 5432
-;password = xxxx
-schema = admin_bdys
+host = localhost
+user = lds_bde
+port = 5432
+#password = <dbpass>
+schema = admin_bdys_import
 
 [layer]
 name = territorial_authority
@@ -66,7 +66,7 @@ ftpregex=Stats_MB_TA_WKT_\d{8}[-NEW]*.zip
 
 
 [nzlocalities]
-filepath=/mnt/geo_dat/NZ Localities/
+filepath=/mnt/gisdata/NZ Localities/
 filename=nz_localities
 
 

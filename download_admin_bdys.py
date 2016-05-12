@@ -10,6 +10,7 @@
 # LICENSE file for more information.
 #
 ################################################################################
+__version__ = 1.0
 
 import os
 import sys
@@ -19,6 +20,7 @@ import string
 import socket
 import urllib2
 import logging.config
+import getopt
 
 import socket,time
 from zipfile import ZipFile
@@ -139,7 +141,10 @@ class DatabaseConn(object):
         if conf.db_user:
             self.pg_uri = self.pg_uri + ' user=' +  conf.db_user
         if conf.db_pass:
-            self.pg_uri = self.pg_uri + ' password=' +  conf.db_pass
+            self.pg_uri = self.pg_uri + ' password=' +  conf.db_pass        
+        if conf.db_schema:
+            pass
+            #self.pg_uri = self.pg_uri + ' active_schema=' +  conf.db_schema
 
             
         self.pg_ds = None
@@ -162,10 +167,10 @@ class ConfReader(object):
         parser = OptionParser(usage=usage)
         (cmd_opt, args) = parser.parse_args()
            
-        if len(args) == 1:
-            config_files = [args[0]]
-        else:
-            config_files = ['download_admin_bdys.ini']
+        #if len(args) == 1:
+        #    config_files = [args[0]]
+        #else:
+        config_files = ['download_admin_bdys.ini']
         
         parser = SafeConfigParser()
         found = parser.read(config_files)
@@ -231,7 +236,7 @@ class ConfReader(object):
 
 class meshblocks(object):
     
-    f2t = {'Stats_MB_WKT.csv':'meshblock', 'Stats_sudo Meshblock_concordance_WKT.csv':'meshblock_concordance', 'Stats_TA_WKT.csv':'territorial_authority'}
+    f2t = {'Stats_MB_WKT.csv':'meshblock', 'Stats_Meshblock_concordance_WKT.csv':'meshblock_concordance', 'Stats_TA_WKT.csv':'territorial_authority'}
     enc = 'utf-8-sig'
     
     def __init__(self,conf,db): 
@@ -298,7 +303,7 @@ class nzfslocalities(object):
         self.db.connect()
         
         create_opts = ['GEOMETRY_NAME='+'geom']
-        create_opts.append('SCHEMA=' + 'admin_bdys')
+        create_opts.append('SCHEMA=' + self.conf.db_schema)
         create_opts.append('OVERWRITE=' + 'yes')
         
         try:
@@ -320,7 +325,12 @@ class nzfslocalities(object):
             while feature:
                 geom = feature.GetGeometryRef()
                 #esri fix
-                geom = fix_esri_polyon(geom)
+                try:
+                        geom = fix_esri_polyon(geom)
+                except Exception as e:
+                        print 'Feature {} geom error {}'.format(feature.GetFID(),e)
+                        feature = in_layer.GetNextFeature()
+                        continue
                 #poly to multi
                 if geom.GetGeometryType() == ogr.wkbPolygon:
                     geom = ogr.ForceToMultiPolygon(geom)
@@ -334,100 +344,6 @@ class nzfslocalities(object):
         except Exception as e:
             logger.fatal('Can not populate NZ_Localities output table {}'.format(e))
             sys.exit(1)
-        
-class paramikosftp(object):
-    
-    def __init__(self,conf):
-        self.conf = conf
-        
-    def fetch(self):
-        
-        transport = Transport((self.conf.meshblock_ftphost,int(self.conf.meshblock_ftpport)))
-        transport.connect(hostkey=None, username=self.conf.meshblock_ftpuser, password=self.conf.meshblock_ftppass, pkey=None)
-                    #gss_host=None, gss_auth=False, gss_kex=False, gss_deleg_creds=True)# not in this version
-        sftp = SFTPClient.from_transport(transport) 
-        localfile = None
-        for fname in sftp.listdir(self.conf.meshblock_ftppath):
-            fmatch = re.match(self.conf.meshblock_ftpregex,fname)
-            if fmatch: 
-                localfile = fmatch.group(0)
-                break
-        if not localfile: sys.exit(1)
-        
-        localpath = '{}/{}'.format(self.conf.meshblock_localpath,localfile)
-        remotepath = '{}/{}'.format(self.conf.meshblock_ftppath,localfile)
-        print (remotepath,'->',localpath)
-        sftp.get(remotepath, localpath)
-                
-        sftp.close()
-        transport.close()
-        return localpath
-    
-class twistedsftp(object):
-    #Failure: twisted.conch.error.ConchError: ("couldn't match all kex parts", 3)
-    class SFTPSession(SSHChannel):
-        name = 'session'
-    
-        def channelOpen(self, whatever):
-            d = self.conn.sendRequest(
-                self, 'subsystem', NS('sftp'), wantReply=True)
-            d.addCallbacks(self._cbSFTP)
-    
-    
-        def _cbSFTP(self, result):
-            client = FileTransferClient()
-            client.makeConnection(self)
-            self.dataReceived = client.dataReceived
-            self.conn._sftp.callback(client)
-    
-    
-    
-    class SFTPConnection(SSHConnection):
-        def serviceStarted(self):
-            self.openChannel(SFTPSession())
-            
-            
-    def sftp(self,user, host, port):
-        options = ClientOptions()
-        options['host'] = host
-        options['port'] = port
-        conn = TwistedSFTP.SFTPConnection()
-        conn._sftp = Deferred()
-        auth = SSHUserAuthClient(user, options, conn)
-        connect(host, port, options, verifyHostKey, auth)
-        return conn._sftp
-
-    
-    def __init__(self,conf):    
-
-        user = conf.meshblock_ftpuser
-        host = conf.meshblock_ftphost
-        port = int(conf.meshblock_ftpport)
-        self.d = self.sftp(user, host, port)
-        self.run()
-        
-    
-    def fetch(self):
-        self.d.addCallback(self.get)
-        self.d.addErrback(err, "Problem with SFTP transfer")
-        self.d.addCallback(lambda ignored: reactor.stop())
-        reactor.run()
-        
-    @staticmethod
-    def get(client):
-        d = client.listDirectory('.')
-#         def cbDir(ignored):
-#             print 'listed directory'
-#         d.addCallback(cbDir)
-#         return d
-
-    def run(self):
-        self.d.addCallback(self.get)
-        self.d.addErrback(err, "Problem with SFTP transfer")
-        self.d.addCallback(lambda ignored: reactor.stop())
-        reactor.run()
-
-class shellsftp(object):
     
     def __init__(self,conf):
         self.conf = conf
@@ -505,15 +421,32 @@ class pexpectsftp(object):
 TODO
 file name reader, db overwrite
 '''
-def main():
-    
+def main():    
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "h", ["help"])
+    except getopt.error, msg:
+        print msg
+        print "for help use --help"
+        sys.exit(2)
+        
+        
+    for opt, val in opts:
+        if opt in ("-h", "--help"):
+            print __doc__
+            sys.exit(0)
+        elif opt in ("-v", "--version"):
+            print __version__
+            sys.exit(0)
+
     c = ConfReader()
     d = DatabaseConn(c)
         
-    
-    #taboundaries(c)
-    meshblocks(c,d)
-    nzfslocalities(c,d)
+    if 't' in args:
+        taboundaries(c)    
+    if len(args)==0 or 'm' in args:
+        meshblocks(c,d)
+    if len(args)==0 or 'l' in args:
+        nzfslocalities(c,d)
     
 if __name__ == "__main__":
     main()
