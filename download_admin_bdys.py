@@ -10,6 +10,12 @@
 # LICENSE file for more information.
 #
 ################################################################################
+# Notes
+# to fetch localities file need share created to \\prdassfps01\GISData\Electoral specific\Enrollment Services\Meshblock_Address_Report
+# to fetch meshblock data need sftp connection to 144.66.244.17/Meshblock_Custodianship 
+# without updated python >2.7.9 cant use paramiko (see commit history) use pexpect instead
+# database conn uses lds_bde user and modifed pg_hba allowing; local, lds_bde, linz_db, peer 
+
 __version__ = 1.0
 
 import os
@@ -24,25 +30,21 @@ import getopt
 
 import socket,time
 from zipfile import ZipFile
-from paramiko import Transport, SFTPClient
 
+#from paramiko import Transport, SFTPClient
 
-from twisted.internet import reactor
-from twisted.internet.defer import Deferred
-
-from twisted.conch.ssh.common import NS
-from twisted.conch.scripts.cftp import ClientOptions
-from twisted.conch.ssh.filetransfer import FileTransferClient
-from twisted.conch.client.connect import connect
-from twisted.conch.client.default import SSHUserAuthClient, verifyHostKey
-from twisted.conch.ssh.connection import SSHConnection
-from twisted.conch.ssh.channel import SSHChannel
-
-from twisted.python.log import startLogging, err
-
+# from twisted.internet import reactor
+# from twisted.internet.defer import Deferred
+# from twisted.conch.ssh.common import NS
+# from twisted.conch.scripts.cftp import ClientOptions
+# from twisted.conch.ssh.filetransfer import FileTransferClient
+# from twisted.conch.client.connect import connect
+# from twisted.conch.client.default import SSHUserAuthClient, verifyHostKey
+# from twisted.conch.ssh.connection import SSHConnection
+# from twisted.conch.ssh.channel import SSHChannel
+# from twisted.python.log import startLogging, err
 
 from subprocess import Popen,PIPE,check_output
-
 
 import pexpect
 
@@ -68,6 +70,8 @@ osr.UseExceptions()
 ogr.UseExceptions()
 
 logger = None
+
+PREFIX = 'temp_'
 
 # translate geometry to 0-360 longitude space
 def shift_geom ( geom ):
@@ -158,6 +162,9 @@ class DatabaseConn(object):
          
         if self.conf.db_rolename:
            self.pg_ds.ExecuteSQL("SET ROLE " + self.conf.db_rolename)
+           
+    def disconnect(self):
+        del self.pg_ds
                    
 class ConfReader(object):
     
@@ -221,7 +228,7 @@ class ConfReader(object):
             self.shift_geometry = parser.getboolean('layer', 'shift_geometry')
             
         #meshblocks
-        for section in ('meshblock','nzlocalities'):
+        for section in ('meshblock','meshblockcsv','nzlocalities'):
             for option in parser.options(section): 
                 setattr(self,'{}_{}'.format(section,option),parser.get(section,option))
             
@@ -234,80 +241,101 @@ class ConfReader(object):
     
 
 
-class meshblocks(object):
+# class meshblock_csv(object):
+#     
+#     f2t = {'Stats_MB_WKT.csv':'temp_meshblock', \
+#            'Stats_Meshblock_concordance_WKT.csv':'temp_meshblock_concordance', \
+#            'Stats_TA_WKT.csv':'temp_territorial_authority'}
+#     enc = 'utf-8-sig'
+#     
+#     def __init__(self,conf,db): 
+#         self.db = db
+#         self.conf = conf
+#         self.sftp = pexpectsftp(conf)
+#         self.file = self.sftp.fetch()
+#         self.insert(self.file)
+#         
+#     def insert(self,mb):
+#         self.db.connect()
+#         #mb = '/home/jramsay/Downloads/Stats_MB_TA_WKT_20160415-NEW.zip'
+#         with ZipFile(mb,'r') as h:
+#             for fname in h.namelist():
+#                 first = True
+#                 with h.open(fname,'r') as fh:
+#                     for line in fh:
+#                         line = line.strip().decode(self.enc)#.replace('"','\'')
+#                         if first: 
+#                             headers = line.split(',')
+#                             first = False
+#                         else:
+#                             values = line.replace("'","''").split(',',len(headers)-1)
+#                             #if int(values[0])<47800:continue
+#                             if '"NULL"' in values: continue
+#                             qry = self.query(self.conf.db_schema,self.f2t[fname],headers,values)
+#                             try:
+#                                 self.db.pg_ds.ExecuteSQL(qry)
+#                             except Exception as e:
+#                                 logger.error('Error inserting MB data into {}\n{}'.format(fname,e))
+#                                 
+#                         
+#     def query(self,schema,table,headers,values):
+#         q = 'INSERT INTO {}.{} ({}) VALUES ({})'.format(schema,table,','.join(headers).lower(),','.join(values)).replace('"','\'')
+#         #q = 'INSERT INTO {}.{} VALUES ({})'.format(schema,table,','.join(line)).replace('"','\'')
+#         return q
+
+class processor(object):
+    mbcc = ('OBJECTID','Meshblock','TA','TA Ward','Community Board','TA Subdivision','TA Maori_Ward','Region', \
+            'Region Constituency','Region Maori Constituency','DHB','DHB Constituency','GED 2007','MED 2007', \
+            'High Court','District Court','GED','MED','Licensing Trust Ward')
+
+    f2t = {'Stats_MB_WKT.csv':('meshblock','<todo create columns>'), \
+           'Stats_Meshblock_concordance.csv':('meshblock_concordance',mbcc), \
+           'Stats_Meshblock_concordance_WKT.csv':('meshblock_concordance',mbcc), \
+           'Stats_TA_WKT.csv':('territorial_authority','<todo create columns>')}
+           
+    l2t = {'nz_localities':('nz_locality','<todo create columns>')}
     
-    f2t = {'Stats_MB_WKT.csv':'meshblock', 'Stats_Meshblock_concordance_WKT.csv':'meshblock_concordance', 'Stats_TA_WKT.csv':'territorial_authority'}
     enc = 'utf-8-sig'
     
-    def __init__(self,conf,db): 
-        self.db = db
-        self.conf = conf
-        #self.sftp = paramikosftp(conf) #kex error for paramiko_ver < 1.15
-        #self.sftp = twistedsftp(conf) #kex error all versions
-        #self.sftp = shellsftp(conf) #password sending problems
-        self.sftp = pexpectsftp(conf)
-        self.file = self.sftp.fetch()
-        self.insert(self.file)
-        
-    def insert(self,mb):
-        self.db.connect()
-        #mb = '/home/jramsay/Downloads/Stats_MB_TA_WKT_20160415-NEW.zip'
-        with ZipFile(mb,'r') as h:
-            for fname in h.namelist():
-                first = True
-                with h.open(fname,'r') as fh:
-                    for line in fh:
-                        line = line.strip().decode(self.enc)#.replace('"','\'')
-                        if first: 
-                            headers = line.split(',')
-                            first = False
-                        else:
-                            values = line.replace("'","''").split(',',len(headers)-1)
-                            #if int(values[0])<47800:continue
-                            if '"NULL"' in values: continue
-                            qry = self.query(self.conf.db_schema,self.f2t[fname],headers,values)
-                            try:
-                                self.db.pg_ds.ExecuteSQL(qry)
-                            except Exception as e:
-                                logger.error('Error inserting MB data into {}\n{}'.format(fname,e))
-                                
-                        
-    def query(self,schema,table,headers,values):
-        q = 'INSERT INTO {}.{} ({}) VALUES ({})'.format(schema,table,','.join(headers).lower(),','.join(values)).replace('"','\'')
-        #q = 'INSERT INTO {}.{} VALUES ({})'.format(schema,table,','.join(line)).replace('"','\'')
-        return q
-
-    
-class nzfslocalities(object):
-    
-    prefixes = ('shp','shx','dbf','prj')
-    
     def __init__(self,conf,db):
+        self.suffix = 'shp'
         self.conf = conf
         self.db = db
         self.driver = ogr.GetDriverByName('ESRI Shapefile')
-        self.shape_ds = None
-        layer = self.fetch()
-        self.insert(layer)
-        self.shape_ds.Destroy()
+        self.fetch()
     
-    def fetch(self):
-        prefix = 'shp'
-        remotepath = '{}{}.{}'.format(self.conf.nzlocalities_filepath,self.conf.nzlocalities_filename,prefix)
-        self.shape_ds = self.driver.Open(remotepath,0)
-        if self.shape_ds:
-            layer = self.shape_ds.GetLayer(0)
-            return layer
+    def recent(self,filelist,pattern='[a-zA-Z_]*(\d{8}).*'):
+        '''get the latest date labelled file from a list'''
+        extract = {re.match(pattern,val).group(1):val for val in filelist if re.match(pattern,val)} 
+        return extract[max(extract)]
         
-    def insert(self,in_layer):
+    def delete(self,path,base):
+        '''clean up unzipped shapefile'''
+        for shapepart in os.listdir(path):
+            if re.match(base,shapepart): os.remove(path+'/'+shapepart)
+            
+    def query(self,schema,table,headers='',values='',flag=2):
+        q = {}
+        q[0] = "select count(*) from information_schema.tables where table_schema like '{}' and table_name = '{}'" # s t
+        q[1] = 'create table {}.{} ({})' # s.t (c)
+        q[2] = 'insert into {}.{} ({}) values ({})' # s.t (c) (v)
+        q[3] = 'truncate table {}.{}' # s.t
+        h = ','.join([i.replace(' ','_') for i in headers]).lower() if hasattr(headers,'__iter__') else headers
+        v = ','.join(values) if hasattr(values,'__iter__') else values
+        return q[flag].format(schema,table,h, v).replace('"','\'')
+    
+    def insertshp(self,in_layer):
         self.db.connect()
         
+        #options
         create_opts = ['GEOMETRY_NAME='+'geom']
         create_opts.append('SCHEMA=' + self.conf.db_schema)
         create_opts.append('OVERWRITE=' + 'yes')
         
-        try:
-            out_name = in_layer.GetName()
+        #create new layer
+        try: 
+            in_name = in_layer.GetName()
+            out_name = PREFIX+self.l2t[in_name][0] if self.l2t.has_key(in_name) else in_name
             out_srs = in_layer.GetSpatialRef()
             out_layer = self.db.pg_ds.CreateLayer(
                 out_name,
@@ -315,55 +343,122 @@ class nzfslocalities(object):
                 geom_type = ogr.wkbMultiPolygon,
                 options = create_opts
             )
+            #build layer fields
+            in_ldef = in_layer.GetLayerDefn()
+            for i in range(0, in_ldef.GetFieldCount()):
+                in_fdef = in_ldef.GetFieldDefn(i)
+                out_layer.CreateField(in_fdef)
+                
         except Exception as e:
             logger.fatal('Can not create NZ_Localities output table {}'.format(e))
             sys.exit(1)
             
+        #insert features
         try:
             in_layer.ResetReading()
-            feature = in_layer.GetNextFeature()
-            while feature:
-                geom = feature.GetGeometryRef()
-                #esri fix
-                try:
-                        geom = fix_esri_polyon(geom)
-                except Exception as e:
-                        print 'Feature {} geom error {}'.format(feature.GetFID(),e)
-                        feature = in_layer.GetNextFeature()
-                        continue
-                #poly to multi
-                if geom.GetGeometryType() == ogr.wkbPolygon:
-                    geom = ogr.ForceToMultiPolygon(geom)
-                #geog to geom
+            in_feat = in_layer.GetNextFeature()
+            out_ldef = out_layer.GetLayerDefn()
+            while in_feat:
+                out_feat = ogr.Feature(out_ldef)
+                for i in range(0, out_ldef.GetFieldCount()):
+                    out_feat.SetField(out_ldef.GetFieldDefn(i).GetNameRef(), in_feat.GetField(i))
+                geom = in_feat.GetGeometryRef()
                 if out_srs.IsGeographic() and self.conf.shift_geometry:
-                    shift_geom(geom)
-                feature.SetGeometry(geom)
-                out_layer.CreateFeature(feature)
-                feature = in_layer.GetNextFeature()
+                        shift_geom(geom)
+                geom = ogr.ForceToMultiPolygon(geom)
+                out_feat.SetGeometry(geom)
+                out_layer.CreateFeature(out_feat)
+                in_feat = in_layer.GetNextFeature()
+
             
         except Exception as e:
-            logger.fatal('Can not populate NZ_Localities output table {}'.format(e))
+            logger.fatal('Can not populate {} output table {}'.format(e))
             sys.exit(1)
+            
+    def insertcsv(self,mbpath,mbfile):
+        self.db.connect()
+        #mb = '/home/jramsay/Downloads/Stats_MB_TA_WKT_20160415-NEW.zip'
+        first = True
+        csvhead = self.f2t[mbfile]
+        csvhead[0] = PREFIX+csvhead[0]
+        with open(mbpath,'r') as fh:
+            for line in fh:
+                line = line.strip().decode(self.enc)#.replace('"','\'')
+                if first: 
+                    headers = line.split(',')
+                    inspectqry = self.query(self.conf.db_schema,csvhead[0],flag=0)
+                    #lyr = self.execute(inspectqry)
+                    #fet = lyr.GetNextFeature()
+                    if self.execute(inspectqry).GetNextFeature().GetFieldAsInteger(0) == 0:
+                        storedheaders = ','.join(['{} VARCHAR'.format(m.replace(' ','_')) for m in csvhead[1]])
+                        createqry = self.query(self.conf.db_schema,csvhead[0],storedheaders,flag=1)
+                        self.execute(createqry)
+                    else:
+                        truncqry = self.query(self.conf.db_schema,csvhead[0],flag=3)
+                        self.execute(truncqry)
+                    first = False
+                else:
+                    values = line.replace("'","''").split(',',len(headers)-1)
+                    #if int(values[0])<47800:continue
+                    if '"NULL"' in values: continue
+                    insertqry = self.query(self.conf.db_schema,csvhead[0],headers,values)
+                    self.execute(insertqry)
+
+                              
+    def execute(self,q):  
+        try:
+            return self.db.pg_ds.ExecuteSQL(q)
+        except Exception as e:
+            logger.error('Error executing query {}\n{}'.format(q,e))
     
-    def __init__(self,conf):
-        self.conf = conf
+class meshblock(processor):
+    '''Extract and process the meshblock, concordance and boundaries layers'''
+    
+    def __init__(self,conf,db):
+        super(meshblock,self).__init__(conf,db)
         
     def fetch(self):
-        #ret = subprocess.check_output(['sshpass','-p',self.conf.meshblock_ftppass,'sftp','{}@{}'.format(self.conf.meshblock_ftpuser,self.conf.meshblock_ftphost)])
-        #if ret == 'Password':
-        #    ret = subprocess.check_output([self.conf.meshblock_ftppass])
-        #else: print 'username/host combo failed',ret
-        #listing = subprocess.check_output(['ls',self.conf.meshblock_ftppath])
-        #print listing
-        target = '{}@{}:{}'.format(self.conf.meshblock_ftpuser,self.conf.meshblock_ftphost,self.conf.meshblock_ftppath)
-        proc = Popen(['sftp',target],stdin=PIPE,stdout=PIPE)
-        proc.stdin.write(self.conf.meshblock_ftppass)
-        #proc = check_output('sftp '+target,shell=True)
-        print proc
-        print proc.communicate()
-        proc.communicate(input=self.conf.meshblock_ftppass+'\n')
-        print 2,proc
-        print 9
+        ds = None
+        path = self.conf.meshblock_localpath
+        remotefile = self.recent(os.listdir(self.conf.meshblock_filepath),self.conf.meshblock_filepattern)
+        remotepath = '{}{}'.format(self.conf.meshblock_filepath,remotefile)
+
+        with ZipFile(remotepath, 'r') as remotezip:
+            remotezip.extractall(path)
+        
+        #extract the shapefiles
+        for mbfile in os.listdir(path):
+            mbpath = '{}/{}'.format(path,mbfile)
+            #extract the shapefiles
+            if re.match('.*\.{}$'.format(self.suffix),mbfile):
+                ds = self.driver.Open(mbpath,0)
+                self.insertshp(ds.GetLayer(0))   
+                self.delete(path,mbfile[:mbfile.index('.')])  
+                ds.Destroy()
+                
+            #extract the concordance csv
+            elif re.match('.*\.csv$',mbfile):
+                self.insertcsv(mbpath,mbfile)
+                
+        
+        
+
+        
+class nzfslocalities(processor):
+    '''Exract and process the nz_localities file'''
+    #NB new format, see nz_locality
+    
+    def __init__(self,conf,db):
+        super(nzfslocalities,self).__init__(conf,db)
+    
+    def fetch(self):
+        suffix = 'shp'
+        ds = None
+        remotepath = '{}{}.{}'.format(self.conf.nzlocalities_filepath,self.conf.nzlocalities_filename,self.suffix)
+        ds = self.driver.Open(remotepath,0)
+        if ds:
+            self.insertshp(ds.GetLayer(0))
+            ds.Destroy()
         
 class PExpectException(Exception):pass
 class pexpectsftp(object):  
@@ -444,9 +539,13 @@ def main():
     if 't' in args:
         taboundaries(c)    
     if len(args)==0 or 'm' in args:
-        meshblocks(c,d)
+        meshblock(c,d)
     if len(args)==0 or 'l' in args:
         nzfslocalities(c,d)
     
 if __name__ == "__main__":
     main()
+    print 'finished'
+
+
+
