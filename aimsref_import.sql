@@ -44,7 +44,7 @@ declare
 	drop_cols text[];
 	cast_cols text[][];
 	dc text;
-	cc text;
+	cc text[];
 	final_table text;
 	result record;
 	
@@ -120,11 +120,11 @@ begin
 			execute qstr;-- into result;
 		end loop;
 	end if;
-
+	--select admin_bdys_import.import_admin_boundary('nz_locality')
 	if array_length(cast_cols,1) > 0 then
-		foreach cc in array cast_cols
+		foreach cc slice 1 in ARRAY cast_cols[1:3]
 		loop
-			qstr := 'alter table '|| map_table ||' alter column '|| cc ||' set data type '|| cc;
+			qstr := 'alter table '|| map_table ||' alter column '|| cc[1] ||' set data type '|| cc[2];
 			raise notice '3.2 %',qstr;	
 			execute qstr;-- into result;
 		end loop;

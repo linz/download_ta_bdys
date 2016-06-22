@@ -240,6 +240,8 @@ class ConfReader(object):
         logger.info('Starting download TA boundaries')
     
 
+# Replaced when we decided to use the shapefile mounted data source as a temp solution
+# though the SFTP option is still open depending on access
 
 # class meshblock_csv(object):
 #     
@@ -288,12 +290,12 @@ class processor(object):
             'Region Constituency','Region Maori Constituency','DHB','DHB Constituency','GED 2007','MED 2007', \
             'High Court','District Court','GED','MED','Licensing Trust Ward')
 
-    f2t = {'Stats_MB_WKT.csv':('meshblock','<todo create columns>'), \
-           'Stats_Meshblock_concordance.csv':('meshblock_concordance',mbcc), \
-           'Stats_Meshblock_concordance_WKT.csv':('meshblock_concordance',mbcc), \
-           'Stats_TA_WKT.csv':('territorial_authority','<todo create columns>')}
+    f2t = {'Stats_MB_WKT.csv':['meshblock','<todo create columns>'], \
+           'Stats_Meshblock_concordance.csv':['meshblock_concordance',mbcc], \
+           'Stats_Meshblock_concordance_WKT.csv':['meshblock_concordance',mbcc], \
+           'Stats_TA_WKT.csv':['territorial_authority','<todo create columns>']}
            
-    l2t = {'nz_localities':('nz_locality','<todo create columns>')}
+    l2t = {'nz_localities':['nz_locality','<todo create columns>']}
     
     enc = 'utf-8-sig'
     
@@ -358,18 +360,21 @@ class processor(object):
             in_layer.ResetReading()
             in_feat = in_layer.GetNextFeature()
             out_ldef = out_layer.GetLayerDefn()
-            while in_feat:
+            while in_feat:                
                 out_feat = ogr.Feature(out_ldef)
                 for i in range(0, out_ldef.GetFieldCount()):
                     out_feat.SetField(out_ldef.GetFieldDefn(i).GetNameRef(), in_feat.GetField(i))
                 geom = in_feat.GetGeometryRef()
+                #1. fix_esri_polygon (no longer needed?)
+                #geom = fix_esri_polyon(geom)
+                #2. shift_geom
                 if out_srs.IsGeographic() and self.conf.shift_geometry:
                         shift_geom(geom)
+                #3. always force, bugfix
                 geom = ogr.ForceToMultiPolygon(geom)
                 out_feat.SetGeometry(geom)
                 out_layer.CreateFeature(out_feat)
                 in_feat = in_layer.GetNextFeature()
-
             
         except Exception as e:
             logger.fatal('Can not populate {} output table {}'.format(e))
@@ -535,9 +540,10 @@ def main():
 
     c = ConfReader()
     d = DatabaseConn(c)
-        
-    if 't' in args:
-        taboundaries(c)    
+    
+    #is territorial_authority included in the meshblocks download the same as the old taboundaries    
+    #if len(args)==0 or 't' in args:
+    #    taboundaries(c)    
     if len(args)==0 or 'm' in args:
         meshblock(c,d)
     if len(args)==0 or 'l' in args:
