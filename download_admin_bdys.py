@@ -265,7 +265,7 @@ class ConfReader(object):
             self.shift_geometry = parser.getboolean('layer', 'shift_geometry')
             
         #meshblocks
-        for section in ('connection','meshblock','nzlocalities'):
+        for section in ('connection','meshblock','nzlocalities','database'):
             for option in parser.options(section): 
                 setattr(self,'{}_{}'.format(section,option),parser.get(section,option))
             
@@ -462,7 +462,7 @@ class Meshblock(Processor):
              
     def run(self):
         self.get()
-        return self.process()
+        return self.secname,self.process()
         
     def get(self): 
         dfile = self.sftp.fetch(self.secname)
@@ -511,7 +511,7 @@ class NZLocalities(Processor):
         
     def run(self):
         self.get()
-        return self.process()
+        return self.secname,self.process()
         
     def get(self): 
         pass
@@ -523,9 +523,9 @@ class NZLocalities(Processor):
         if not pathlist: pathlist = '{}{}.shp'.format(self.conf.nzlocalities_filepath,self.conf.nzlocalities_filename)
         ds = self.driver.Open(pathlist,0)
         if ds:
-            #self.mapcolumns(type(self).__name__.lower(),self.insertshp(ds.GetLayer(0)))
+            
             tname = 'nz_locality'
-            self.mapcolumns('nz_locality')
+            #self.mapcolumns(tname)
             tlist += (tname,)
             ds.Destroy()
         self.db.disconnect()
@@ -536,34 +536,55 @@ class Version(object):
     importfile = 'aimsref_import.sql'
     qtv = 'select table_version.ver_apply_table_differences({}, {}, {})'
     
-    def __init__(self,conf,db):
+    def __init__(self,conf,cm,db):
         self.conf = conf
+        self.cm = cm
         self.db = db
+        
+    def run(self,t):
+        self.setup()
+        self.versiontables(t)
+        self.teardown()
         
     def setup(self):
         '''Create temp schema'''
-        tv = None
+        self.qset = self._testquery#self._query
         self.db.connect()
-        #self.db.pg_ds.ExecuteSQL('CREATE SCHEMA temp_{}'.format(self.conf.db_schema))
-        with open(self.importfile,'r') as h:
-            tv = h.read()
-#         use this to check for foreign characters
-#         n=0
-#         for l in tv:
-#             print n,l
-#             n+=1
-        self.db.pg_ds.ExecuteSQL(tv)
-        self.db.disconnect()
+        #self.db.pg_ds.ExecuteSQL('CREATE SCHEMA temp_{}'.format(self.conf.database_schema))
+#         with open(self.importfile,'r') as h:
+#             tv = h.read()
+#         self.db.pg_ds.ExecuteSQL(tv)
         
+    def _testquery(self,original,snap,imported,pk):
+        '''Temp setup to create temporary tables without interfering with in-use admin_bdy tables'''
+        q = []
+        q.append('create table {} as select * from {}'.format(snap,original))
+        q.append('alter table {} add primary key ({})'.format(snap,pk))
+        q.append("select table_version.ver_apply_table_differences('{}','{}','{}')".format(snap,imported,pk))
+        print q[0],'\n',q[1],'\n',q[2]    
+        return q
+        
+    def _query(self,original,snap,imported,pk):
+        '''run table version apply diffs'''
+        q = []
+        q.append('select table_version.ver_apply_table_differences({},{},{})'.format(snap,imported,pk))
+        print q[0]
+        return q
         
     def versiontables(self,tablelist):
-        for t in tablelist:
-            self.db.pg_ds.ExecuteSQL('SELECT {}.import_admin_boundary({})'.format(self.conf.db_schema,t))
-            #self.db.pg_ds.ExecuteSQL('SELECT {}.import_admin_boundary({})'.format(self.conf.db_schema,t))
+        for section in tablelist:
+            sec, tab = section
+            for t in tab:
+                pk = self.cm.map[sec][t]['primary']
+                snap = '{}.snap_{}'.format(self.conf.database_schema,t)
+                original = '{}.{}'.format(self.conf.database_originschema,t)
+                imported = '{}.{}'.format(self.conf.database_schema,PREFIX+t)
+                for q in self.qset(original,snap, imported,pk): self.db.pg_ds.ExecuteSQL(q)
             
     def teardown(self):
         '''drop temp schema'''
-        self.db.pg_ds.ExecuteSQL('DROP SCHEMA IF EXISTS temp_{}'.format(self.conf.db_schema))
+        #self.db.pg_ds.ExecuteSQL('DROP SCHEMA IF EXISTS temp_{}'.format(self.conf.database_schema))
+        self.db.disconnect()
         
     
 class PExpectException(Exception):pass
@@ -644,23 +665,16 @@ def main():
     m = ColumnMapper(c)
     d = DatabaseConn(c)
     s = PExpectSFTP(c)
-    v = Version(c,d)
-    
-    v.setup()
-    
-    #is territorial_authority included in the meshblocks download the same as the old taboundaries    
-    #if len(args)==0 or 't' in args:
-    #    taboundaries(c)    
+    v = Version(c,m,d)
+     
     if len(args)==0 or 'm' in args:
         mbk = Meshblock(c,d,m,s)
         t += (mbk.run(),)
     if len(args)==0 or 'l' in args:
         nzl = NZLocalities(c,d,m,s) 
         t += (nzl.run(),)
-        
-    v = Version(d)
-    v.versiontables(t)
-    v.teardown()
+
+    v.run(t)
     
 if __name__ == "__main__":
     main()
