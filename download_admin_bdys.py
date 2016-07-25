@@ -27,6 +27,7 @@ import socket
 import urllib2
 import logging.config
 import getopt
+import psycopg2
 
 import socket,time
 from zipfile import ZipFile
@@ -72,6 +73,8 @@ ogr.UseExceptions()
 logger = None
 
 PREFIX = 'temp_'
+TEST = True
+CLEAN = True
 
 # translate geometry to 0-360 longitude space
 def shift_geom ( geom ):
@@ -131,7 +134,7 @@ class ColumnMapperError(Exception):pass
 class ColumnMapper(object):
     '''Acions the list of column mappings from conf file'''
     map = {}
-    dra = {'drop':'ALTER TABLE {schema}.{table} DROP COLUMN {drop}',
+    dra = {'drop':'ALTER TABLE {schema}.{table} DROP COLUMN IF EXISTS {drop}',
            'rename':'ALTER TABLE {schema}.{table} RENAME COLUMN {old} TO {new}',
            'add':'ALTER TABLE {schema}.{table} ADD COLUMN {add} {type}',
            'cast':'ALTER TABLE {schema}.{table} ALTER COLUMN {cast} SET DATA TYPE {type}'
@@ -160,11 +163,29 @@ class ColumnMapper(object):
         raise ColumnMapperError('Unrecognised query type specifier, use drop/add/rename/cast')    
     
     def _formqry(self,f,d):
-        print f,d
-        print f.format(*d)
+        #print f,d
+        #print f.format(*d)
         return f.format(*d)
         
     
+class DatabaseConn_NonOGR(object):
+    def __init__(self,conf):
+        self.conf = conf
+        
+    def connect(self):
+        self.pconn = psycopg2.connect( \
+            host=self.conf.database_host,\
+            database=self.conf.database_name,\
+            user=self.conf.database_user,\
+            password=self.conf.database_password)
+        self.pcur = self.pconn.cursor()
+        
+    def disconnect(self):
+        self.pconn.commit()
+        self.pcur.close()
+        self.pconn.close()
+        
+        
 class DatabaseConn(object):
     
     def __init__(self,conf):
@@ -192,13 +213,13 @@ class DatabaseConn(object):
         
     def connect(self):
         try:
-            self.pg_ds = self.pg_drv.Open(self.pg_uri, update = 1)
+            if not self.pg_ds: 
+                self.pg_ds = self.pg_drv.Open(self.pg_uri, update = 1)
+                if self.conf.db_rolename:
+                    self.pg_ds.ExecuteSQL("SET ROLE " + self.conf.db_rolename)
         except Exception as e:
             logger.fatal("Can't open PG output database: " + str(e))
             sys.exit(1)
-         
-        if self.conf.db_rolename:
-           self.pg_ds.ExecuteSQL("SET ROLE " + self.conf.db_rolename)
            
     def disconnect(self):
         del self.pg_ds
@@ -287,9 +308,12 @@ class Processor(object):
            'Stats_Meshblock_concordance_WKT.csv':['meshblock_concordance',mbcc], \
            'Stats_TA_WKT.csv':['territorial_authority','<todo create columns>']}
            
-    l2t = {'nz_localities':['nz_locality','<todo create columns>'],
-           'StatsNZ_Meshblock':['statsnz_meshblock','<todo create columns>'],
-           'StatsNZ_TA':['statsnz_ta','<todo create columns>']}
+    #mapping for csv|shapefilenames to tablenames
+    #{shapefile:[import tablename, original tablename]}
+    l2t = {'nz_localities':['nz_locality','nz_locality'],
+           'StatsNZ_Meshblock':['statsnz_meshblock','meshblock'],
+           'StatsNZ_TA':['statsnz_ta','territorial_authority'],
+           'Stats_Meshblock_concordance':['meshblock_concordance','meshblock_concordance']}
     
     q = {'find':"select count(*) from information_schema.tables where table_schema like '{}' and table_name = '{}'",
          'create':'create table {}.{} ({})',
@@ -408,33 +432,32 @@ class Processor(object):
     def insertcsv(self,mbfile):
         fp,ff = os.path.split(mbfile) 
         logger.info('Inserting csv {}'.format(ff))
-        self.db.connect()
+        #self.db.connect()
         #mb = '/home/jramsay/Downloads/Stats_MB_TA_WKT_20160415-NEW.zip'
         first = True
         # this is a hack while using temptables
         csvhead = self.f2t[ff]
-        csvhead[0] = PREFIX+csvhead[0]
         with open(ff,'r') as fh:
             for line in fh:
                 line = line.strip().decode(self.enc)#.replace('"','\'')
                 if first: 
                     headers = line.split(',')
-                    findqry = self.query(self.conf.db_schema,csvhead[0],op='find')
+                    findqry = self.query(self.conf.db_schema,PREFIX+csvhead[0],op='find')
                     if self.execute(findqry).GetNextFeature().GetFieldAsInteger(0) == 0:
                         storedheaders = ','.join(['{} VARCHAR'.format(m.replace(' ','_')) for m in csvhead[1]])
-                        createqry = self.query(self.conf.db_schema,csvhead[0],storedheaders,op='create')
+                        createqry = self.query(self.conf.db_schema,PREFIX+csvhead[0],storedheaders,op='create')
                         self.execute(createqry)
                     else:
-                        truncqry = self.query(self.conf.db_schema,csvhead[0],op='trunc')
+                        truncqry = self.query(self.conf.db_schema,PREFIX+csvhead[0],op='trunc')
                         self.execute(truncqry)
                     first = False
                 else:
                     values = line.replace("'","''").split(',',len(headers)-1)
                     #if int(values[0])<47800:continue
                     if '"NULL"' in values: continue
-                    insertqry = self.query(self.conf.db_schema,csvhead[0],headers,values,op='insert')
+                    insertqry = self.query(self.conf.db_schema,PREFIX+csvhead[0],headers,values,op='insert')
                     self.execute(insertqry)
-                    
+        #self.db.disconnect()            
         return csvhead[0]
                            
     def mapcolumns(self,tablename):
@@ -446,11 +469,39 @@ class Processor(object):
     def drop(self,table):
         '''Clean up any previous table instances. Doesn't work!''' 
         return self.execute(self.q['drop'].format(self.conf.db_schema,table))
+    
+    @staticmethod
+    def attempt(conf,exe,q,count=3,depth=3):
+        att = 1
+        m,r = None,None
+        while att<=count and depth>0:
+            try:
+                m = exe(q)
+                return m
+            except RuntimeError as r:
+                print 'Attempt {} using {} failed, {}'.format(att,exe,m or r)
+                if re.search('table_version.ver_apply_table_differences',q) and Processor.nonOGR(conf,q,depth-1): return
+                att += 1
+        if r: raise r
+    
+    @staticmethod
+    def nonOGR(conf,q,d):     
+        try:          
+            nonogr = DatabaseConn_NonOGR(conf)
+            nonogr.connect()
+            Processor.attempt(conf, nonogr.pcur.execute, q, count=3, depth=d)
+            res = nonogr.pcur.fetchone()
+            nonogr.disconnect()
+        except Exception as e:
+            print 'NonOGR driver fail with {}, {}'.format(q,e)
+            raise e
+        return bool(res)
                               
     def execute(self,q):  
         try:
-            logger.info('Executing SQL {}'.format(q))
-            return self.db.pg_ds.ExecuteSQL(q)
+            #logger.info('Executing SQL {}'.format(q))
+            #return self.db.pg_ds.ExecuteSQL(q)
+            return Processor.attempt(self.conf, self.db.pg_ds.ExecuteSQL, q)
         except Exception as e:
             logger.error('Error executing query {}\n{}'.format(q,e))
     
@@ -473,7 +524,7 @@ class Meshblock(Processor):
         
     def process(self,pathlist=None):
         tlist = ()
-        self.db.connect()
+        #self.db.connect()
         ds = None
         if not pathlist: pathlist = [f for f in self.file if re.search('\.csv$|\.shp$',f)]
         #extract the shapefiles
@@ -485,10 +536,10 @@ class Meshblock(Processor):
                 mblayer = mbhandle.GetLayer(0)
                 tname = self.layername(mblayer)
                 #self.drop(tname) #this doesn't work for some reason
-                self.deletelyr(tname)
+                #self.deletelyr(tname)
                 self.insertshp(mblayer)
                 self.mapcolumns(tname)
-                tlist += tname
+                tlist += (tname,)
                 mbhandle.Destroy()
                 
             #extract the concordance csv
@@ -498,7 +549,7 @@ class Meshblock(Processor):
                 tlist += (tname,)
             
             self.delete(mbfile)
-        self.db.disconnect()
+        #self.db.disconnect()
         return tlist
 
         
@@ -518,17 +569,20 @@ class NZLocalities(Processor):
     
     def process(self,pathlist=None):
         tlist = ()
-        self.db.connect()
+        #self.db.connect()
         ds = None
         if not pathlist: pathlist = '{}{}.shp'.format(self.conf.nzlocalities_filepath,self.conf.nzlocalities_filename)
         ds = self.driver.Open(pathlist,0)
         if ds:
             
-            tname = 'nz_locality'
-            #self.mapcolumns(tname)
+            nzlayer = ds.GetLayer(0)
+            tname = self.layername(nzlayer)
+            self.insertshp(nzlayer)
+            self.mapcolumns(tname)
+            
             tlist += (tname,)
             ds.Destroy()
-        self.db.disconnect()
+        #self.db.disconnect()
         return tlist
         
 class Version(object):
@@ -536,54 +590,83 @@ class Version(object):
     importfile = 'aimsref_import.sql'
     qtv = 'select table_version.ver_apply_table_differences({}, {}, {})'
     
-    def __init__(self,conf,cm,db):
+    def __init__(self,conf,cm,db,clean=True):
         self.conf = conf
         self.cm = cm
         self.db = db
+        self.clean = clean
         
-    def run(self,t):
-        self.setup()
-        self.versiontables(t)
-        self.teardown()
+#     def run(self,t):
+#         self.setup()
+#         self.versiontables(t)
+#         self.teardown()
         
     def setup(self):
         '''Create temp schema'''
-        self.qset = self._testquery#self._query
+        self.qset = self._testquery if TEST else self._query
         self.db.connect()
-        #self.db.pg_ds.ExecuteSQL('CREATE SCHEMA temp_{}'.format(self.conf.database_schema))
+        if self.clean:
+            self.db.pg_ds.ExecuteSQL('drop schema if exists {} cascade'.format(self.conf.database_schema))
+            self.db.pg_ds.ExecuteSQL('create schema {}'.format(self.conf.database_schema))
 #         with open(self.importfile,'r') as h:
 #             tv = h.read()
 #         self.db.pg_ds.ExecuteSQL(tv)
         
-    def _testquery(self,original,snap,imported,pk):
+    def _pktest(self,s,t):
+        '''Check whether the table had a primary key already. ExecuteSQL returns layer if successful OR null on error/no-result'''
+        q = "select * from information_schema.table_constraints \
+             where table_schema like '{s}' \
+             and table_name like '{t}' \
+             and constraint_type like 'PRIMARY KEY'".format(s=s,t=t)
+        print 'Q2',q
+        return bool(self.db.pg_ds.ExecuteSQL(q).GetFeatureCount())
+        
+    def _testquery(self,original,snap,imported,pk,srid):
         '''Temp setup to create temporary tables without interfering with in-use admin_bdy tables'''
         q = []
-        q.append('create table {} as select * from {}'.format(snap,original))
-        q.append('alter table {} add primary key ({})'.format(snap,pk))
-        q.append("select table_version.ver_apply_table_differences('{}','{}','{}')".format(snap,imported,pk))
-        print q[0],'\n',q[1],'\n',q[2]    
+        si = imported.split('.')
+        q.append('create table {snap} as select * from {orig}'.format(snap=snap,orig=original))
+        if not self._pktest(si[0],snap.split('.')[1]):
+            q.append('alter table {snap} add primary key ({pk})'.format(snap=snap,pk=pk))
+        if not self._pktest(si[0],si[1]):
+            q.append('alter table {imported} add primary key ({pk})'.format(imported=imported,pk=pk))
+        if srid:
+            q.append("select UpdateGeometrySRID('{schema}','{imported}', 'shape', {srid})".format(schema=si[0],imported=si[1],srid=srid))
+            q.append("update {imported} set shape = ST_Transform(shape::geometry,{srid}::integer)".format(imported=imported,srid=srid))
+        q.append("select table_version.ver_apply_table_differences('{snap}','{imported}','{pk}')".format(snap=snap,imported=imported,pk=pk))
+        #for i in q: print i
         return q
         
-    def _query(self,original,snap,imported,pk):
+    def _query(self,original,snap,imported,pk,srid):
         '''run table version apply diffs'''
         q = []
+        si = imported.split('.')
         q.append('select table_version.ver_apply_table_differences({},{},{})'.format(snap,imported,pk))
-        print q[0]
+        if self._pktest(si[0],si[1]):
+            q.append('alter table {imported} add primary key ({pk})'.format(imported=imported,pk=pk))
+        q.append("select UpdateGeometrySRID('{schema}','{imported}', 'shape', {srid})".format(schema=si[0],imported=si[1],srid=srid))
+        q.append("update {imported} set shape = ST_Transform(shape::geometry,{srid}::integer)".format(imported=imported,srid=srid))
+        q.append("select table_version.ver_apply_table_differences('{original}','{imported}','{pk}')".format(snap=snap,imported=imported,pk=pk))
+        #for i in q: print i
         return q
         
     def versiontables(self,tablelist):
         for section in tablelist:
             sec, tab = section
             for t in tab:
+                t2 = self.cm.map[sec][t]['table']
                 pk = self.cm.map[sec][t]['primary']
+                srid = self.cm.map[sec][t]['srid'] if self.cm.map[sec][t].has_key('srid') else None
                 snap = '{}.snap_{}'.format(self.conf.database_schema,t)
-                original = '{}.{}'.format(self.conf.database_originschema,t)
+                original = '{}.{}'.format(self.conf.database_originschema,t2)
                 imported = '{}.{}'.format(self.conf.database_schema,PREFIX+t)
-                for q in self.qset(original,snap, imported,pk): self.db.pg_ds.ExecuteSQL(q)
-            
+                for q in self.qset(original,snap,imported,pk,srid):
+                    print 'Q1',q
+                    Processor.attempt(self.conf,self.db.pg_ds.ExecuteSQL,q,count=5,depth=3)
+        
     def teardown(self):
         '''drop temp schema'''
-        #self.db.pg_ds.ExecuteSQL('DROP SCHEMA IF EXISTS temp_{}'.format(self.conf.database_schema))
+        if self.clean: self.db.pg_ds.ExecuteSQL('drop schema if exists {}'.format(self.conf.database_schema))
         self.db.disconnect()
         
     
@@ -645,6 +728,7 @@ file name reader, db overwrite
 '''
 def main():   
     t = () 
+    _t = (('meshblock', ('statsnz_meshblock', 'statsnz_ta', 'meshblock_concordance')), ('nzlocalities', ('nz_locality',)))
     try:
         opts, args = getopt.getopt(sys.argv[1:], "h", ["help"])
     except getopt.error, msg:
@@ -665,16 +749,18 @@ def main():
     m = ColumnMapper(c)
     d = DatabaseConn(c)
     s = PExpectSFTP(c)
-    v = Version(c,m,d)
-     
+    v = Version(c,m,d,clean=CLEAN)
+    v.setup()
     if len(args)==0 or 'm' in args:
         mbk = Meshblock(c,d,m,s)
         t += (mbk.run(),)
     if len(args)==0 or 'l' in args:
         nzl = NZLocalities(c,d,m,s) 
         t += (nzl.run(),)
-
-    v.run(t)
+    if not t: t = _t
+    print t
+    v.versiontables(t)
+    v.teardown()
     
 if __name__ == "__main__":
     main()
