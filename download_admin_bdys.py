@@ -16,6 +16,14 @@
 # without updated python >2.7.9 cant use paramiko (see commit history) use pexpect instead
 # database conn uses lds_bde user and modifed pg_hba allowing; local, lds_bde, linz_db, peer 
 
+# TODO
+# No | X | Desc
+# ---+---+-----
+# 1. |   | Change legacy database config to common attribute mapping
+# 2. |   | Shift file to table mapping into config
+# 3. |   | Enforce create/drop schema
+# 4. |   | Consistent return types from db calls
+ 
 __version__ = 1.0
 
 import os
@@ -73,8 +81,10 @@ ogr.UseExceptions()
 logger = None
 
 PREFIX = 'temp_'
+SNAP = 'snap_'
 TEST = True
 CLEAN = True
+SELECTION = {'ogr':None,'psy':None}
 
 # translate geometry to 0-360 longitude space
 def shift_geom ( geom ):
@@ -167,10 +177,32 @@ class ColumnMapper(object):
         #print f.format(*d)
         return f.format(*d)
         
+class DBSelectionException(Exception):pass
+class DB(object):
+    def __init__(self,conf,drv):
+        self.conf = conf
+        if drv == 'ogr':
+            self.d = DatabaseConn_ogr(self.conf)
+            self.d.connect()
+        elif drv == 'psy':
+            self.d = DatabaseConn_psycopg2(self.conf)
+            self.d.connect()
+        else:raise DBSelectionException("Choose DB using 'ogr' or 'psy'")
+
+    def get(self,q):
+        return bool(self.d.execute(q))
+        
+    def __enter__(self):
+        return self
     
-class DatabaseConn_NonOGR(object):
+    def __exit__(self,exc_type=None, exc_val=None, exc_tb=None):
+        self.d.disconnect()
+            
+class DatabaseConnectionException(Exception):pass
+class DatabaseConn_psycopg2(object):
     def __init__(self,conf):
         self.conf = conf
+        self.exe = None
         
     def connect(self):
         self.pconn = psycopg2.connect( \
@@ -178,19 +210,31 @@ class DatabaseConn_NonOGR(object):
             database=self.conf.database_name,\
             user=self.conf.database_user,\
             password=self.conf.database_password)
+        self.pconn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
         self.pcur = self.pconn.cursor()
         
+    def execute(self,q):
+        res = None
+        try:
+            self.pcur.execute(q)
+            res = self.pcur.fetchone() or None
+        except Exception as e: DatabaseConnectionException('Database query error, {}'.format(e))
+            
+        #for now just check if row returned as success
+        return bool(res)
+    
     def disconnect(self):
         self.pconn.commit()
         self.pcur.close()
         self.pconn.close()
-        
-        
-class DatabaseConn(object):
+
+
+class DatabaseConn_ogr(object):
     
     def __init__(self,conf):
         
         self.conf = conf
+        self.exe = None
         self.pg_drv = ogr.GetDriverByName('PostgreSQL')
         if self.pg_drv is None:
             logger.fatal('Could not load the OGR PostgreSQL driver')
@@ -220,6 +264,9 @@ class DatabaseConn(object):
         except Exception as e:
             logger.fatal("Can't open PG output database: " + str(e))
             sys.exit(1)
+            
+    def execute(self,q):
+        return self.pg_ds.ExecuteSQL(q)
            
     def disconnect(self):
         del self.pg_ds
@@ -286,7 +333,7 @@ class ConfReader(object):
             self.shift_geometry = parser.getboolean('layer', 'shift_geometry')
             
         #meshblocks
-        for section in ('connection','meshblock','nzlocalities','database'):
+        for section in ('connection','file','meshblock','nzlocalities','database'):
             for option in parser.options(section): 
                 setattr(self,'{}_{}'.format(section,option),parser.get(section,option))
             
@@ -462,46 +509,48 @@ class Processor(object):
                            
     def mapcolumns(self,tablename):
         '''Perform input to final column mapping'''
-        for qlist in [self.cm.action(self.secname,tablename.lower(),adrc) for adrc in ('add','drop','rename','cast')]: 
+        actions = ('add','drop','rename','cast')
+        for qlist in [self.cm.action(self.secname,tablename.lower(),adrc) for adrc in actions]: 
             for q in qlist: 
                 if q: self.execute(q)
                 
     def drop(self,table):
         '''Clean up any previous table instances. Doesn't work!''' 
         return self.execute(self.q['drop'].format(self.conf.db_schema,table))
-    
+
+
     @staticmethod
-    def attempt(conf,exe,q,count=3,depth=3):
+    def attempt(conf,q,select='ogr',depth=2):
+        '''Attempt connection using ogr or psycopg drivers creating temp connection if conn object not stored'''
         att = 1
         m,r = None,None
-        while att<=count and depth>0:
+        while depth>0:
             try:
-                m = exe(q)
-                return m
+                #if using active DB instance 
+                if SELECTION[select]:
+                    m = SELECTION[select].execute(q)
+                    return m
+                #otherwise setup/delete temporary connection
+                else:
+                    with DB(conf,select) as conn:
+                        m = conn.get(q)
+                        return m
             except RuntimeError as r:
-                print 'Attempt {} using {} failed, {}'.format(att,exe,m or r)
-                if re.search('table_version.ver_apply_table_differences',q) and Processor.nonOGR(conf,q,depth-1): return
-                att += 1
+                print 'Attempt {} using {} failed, {}'.format(att,select,m or r)
+                #if re.search('table_version.ver_apply_table_differences',q) and Processor.nonOGR(conf,q,depth-1): return
+                return Processor.attempt(conf, q, Processor._next(select), depth-1)
         if r: raise r
-    
+        
     @staticmethod
-    def nonOGR(conf,q,d):     
-        try:          
-            nonogr = DatabaseConn_NonOGR(conf)
-            nonogr.connect()
-            Processor.attempt(conf, nonogr.pcur.execute, q, count=3, depth=d)
-            res = nonogr.pcur.fetchone()
-            nonogr.disconnect()
-        except Exception as e:
-            print 'NonOGR driver fail with {}, {}'.format(q,e)
-            raise e
-        return bool(res)
+    def _next(s,slist=None):
+        slist = slist or SELECTION
+        return slist.keys()[(slist.keys().index(s)+1)%len(slist)]
                               
     def execute(self,q):  
         try:
             #logger.info('Executing SQL {}'.format(q))
             #return self.db.pg_ds.ExecuteSQL(q)
-            return Processor.attempt(self.conf, self.db.pg_ds.ExecuteSQL, q)
+            return Processor.attempt(self.conf, q)
         except Exception as e:
             logger.error('Error executing query {}\n{}'.format(q,e))
     
@@ -590,27 +639,37 @@ class Version(object):
     importfile = 'aimsref_import.sql'
     qtv = 'select table_version.ver_apply_table_differences({}, {}, {})'
     
-    def __init__(self,conf,cm,db,clean=True):
+    def __init__(self,conf,cm,clean=True):
         self.conf = conf
         self.cm = cm
-        self.db = db
         self.clean = clean
-        
-#     def run(self,t):
-#         self.setup()
-#         self.versiontables(t)
-#         self.teardown()
         
     def setup(self):
         '''Create temp schema'''
-        self.qset = self._testquery if TEST else self._query
-        self.db.connect()
+        global SNAP
+        if TEST:
+            self.qset = self._testquery
+            SNAP = 'snap_'
+        else:
+            self.qset = self._query
+            SNAP = ''
+            
+        #self.db.connect()
         if self.clean:
-            self.db.pg_ds.ExecuteSQL('drop schema if exists {} cascade'.format(self.conf.database_schema))
-            self.db.pg_ds.ExecuteSQL('create schema {}'.format(self.conf.database_schema))
-#         with open(self.importfile,'r') as h:
-#             tv = h.read()
-#         self.db.pg_ds.ExecuteSQL(tv)
+            #self.db.pg_ds.ExecuteSQL('drop schema if exists {} cascade'.format(self.conf.database_schema))
+            #self.db.pg_ds.ExecuteSQL('create schema {}'.format(self.conf.database_schema))
+            q1 = 'drop schema {} cascade'.format(self.conf.database_schema)
+            q2 = 'create schema {}'.format(self.conf.database_schema)
+            Processor.attempt(self.conf, q1, select='psy')
+            Processor.attempt(self.conf, q2, select='psy')
+                    
+    def teardown(self):
+        '''drop temp schema'''
+        if self.clean: 
+            #self.db.pg_ds.ExecuteSQL('drop schema if exists {}'.format(self.conf.database_schema)) 
+            q3 = 'drop schema if exists {}'.format(self.conf.database_schema)
+            Processor.attempt(self.conf, q3, select='psy')
+        #self.db.disconnect()
         
     def _pktest(self,s,t):
         '''Check whether the table had a primary key already. ExecuteSQL returns layer if successful OR null on error/no-result'''
@@ -618,8 +677,9 @@ class Version(object):
              where table_schema like '{s}' \
              and table_name like '{t}' \
              and constraint_type like 'PRIMARY KEY'".format(s=s,t=t)
-        print 'Q2',q
-        return bool(self.db.pg_ds.ExecuteSQL(q).GetFeatureCount())
+        print 'pQ2',q
+        #return bool(self.db.pg_ds.ExecuteSQL(q).GetFeatureCount())
+        return Processor.attempt(self.conf, q, select='psy')
         
     def _testquery(self,original,snap,imported,pk,srid):
         '''Temp setup to create temporary tables without interfering with in-use admin_bdy tables'''
@@ -657,18 +717,56 @@ class Version(object):
                 t2 = self.cm.map[sec][t]['table']
                 pk = self.cm.map[sec][t]['primary']
                 srid = self.cm.map[sec][t]['srid'] if self.cm.map[sec][t].has_key('srid') else None
-                snap = '{}.snap_{}'.format(self.conf.database_schema,t)
+                snap = '{}.{}{}'.format(self.conf.database_schema,SNAP,t)
                 original = '{}.{}'.format(self.conf.database_originschema,t2)
-                imported = '{}.{}'.format(self.conf.database_schema,PREFIX+t)
+                imported = '{}.{}{}'.format(self.conf.database_schema,PREFIX,t)
                 for q in self.qset(original,snap,imported,pk,srid):
-                    print 'Q1',q
-                    Processor.attempt(self.conf,self.db.pg_ds.ExecuteSQL,q,count=5,depth=3)
+                    print 'pQ1',q
+                    Processor.attempt(self.conf,q)
+                #
+                self.gridtables(sec,t,'{}{}'.format(SNAP,t))
+                    
+    def gridtables(self,sec,tab,tname):
+        '''Look for grid specification and grid the table if found'''
+        if self.cm.map.has_key(sec) and self.cm.map[sec].has_key(tab) and self.cm.map[sec][tab].has_key('grid'):
+            e = External(self.conf)
+            e.build(tname,self.cm.map[sec][tab]['grid'])
         
-    def teardown(self):
-        '''drop temp schema'''
-        if self.clean: self.db.pg_ds.ExecuteSQL('drop schema if exists {}'.format(self.conf.database_schema))
-        self.db.disconnect()
+
+class External(object):
+    externals = (('table_grid.sql',"select public.create_table_polygon_grid('{schema}', '{table}', '{column}', {xres}, {yres})"),)
+    
+    def __init__(self,conf):
+        self.conf = conf
         
+        
+    def build(self,tgt,colres):
+        '''Create temp schema'''
+        #self.db.connect()
+        for file,query in self.externals:
+            schema,table = re.search('select ([a-zA-Z_\.]+)',query).group(1).split('.')
+            if not self._fnctest(schema, table):
+                with open(file,'r') as handle:
+                    text = handle.read()
+                #self.db.pg_ds.ExecuteSQL(text)
+                Processor.attempt(self.conf,text)
+            col = colres['geocol']
+            res = colres['res']
+            q = query.format(schema=self.conf.database_schema, table=tgt, column=col, xres=res, yres=res)
+            #self.db.pg_ds.ExecuteSQL(q)
+            Processor.attempt(self.conf,q)
+        #self.db.disconnect()
+            
+    def _fnctest(self,s,t):
+        '''Check whether the table had a primary key already. ExecuteSQL returns layer if successful OR null on error/no-result'''
+        q = "select * from information_schema.routines \
+             where routine_schema like '{s}' \
+             and routine_name like '{t}'".format(s=s,t=t)
+        print 'fQ2',q
+        return Processor.attempt(self.conf, q)
+            
+        
+    
     
 class PExpectException(Exception):pass
 class PExpectSFTP(object):  
@@ -747,20 +845,23 @@ def main():
 
     c = ConfReader()
     m = ColumnMapper(c)
-    d = DatabaseConn(c)
-    s = PExpectSFTP(c)
-    v = Version(c,m,d,clean=CLEAN)
-    v.setup()
-    if len(args)==0 or 'm' in args:
-        mbk = Meshblock(c,d,m,s)
-        t += (mbk.run(),)
-    if len(args)==0 or 'l' in args:
-        nzl = NZLocalities(c,d,m,s) 
-        t += (nzl.run(),)
-    if not t: t = _t
-    print t
-    v.versiontables(t)
-    v.teardown()
+    global SELECTION
+    with DB(c,'ogr') as ogrdb:
+        SELECTION['ogr'] = ogrdb.d
+        #SELECTION['ogr'] = DatabaseConn_ogr(c)
+        s = PExpectSFTP(c)
+        v = Version(c,m,clean=CLEAN)
+        v.setup()
+        if len(args)==0 or 'm' in args:
+            mbk = Meshblock(c,SELECTION['ogr'],m,s)
+            t += (mbk.run(),)
+        if len(args)==0 or 'l' in args:
+            nzl = NZLocalities(c,SELECTION['ogr'],m,s) 
+            t += (nzl.run(),)
+        if not t: t = _t
+        print t
+        v.versiontables(t)
+        v.teardown()
     
 if __name__ == "__main__":
     main()
