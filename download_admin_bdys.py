@@ -21,8 +21,9 @@
 # ---+---+-----
 # 1. |   | Change legacy database config to common attribute mapping
 # 2. |   | Shift file to table mapping into config
-# 3. |   | Enforce create/drop schema
+# 3. | x | Enforce create/drop schema
 # 4. |   | Consistent return types from db calls
+# 5. |   | Validation framework
  
 __version__ = 1.0
 
@@ -66,12 +67,14 @@ try:
 except:
     try:
         import ogr, osr, gdal
-    except:
-        sys.exit('ERROR: cannot find python OGR and GDAL modules')
+    except Exception as e:
+        raise Exception('ERROR: cannot find python OGR and GDAL modules'+str(e))
+        #sys.exit('ERROR: cannot find python OGR and GDAL modules')
 
 version_num = int(gdal.VersionInfo('VERSION_NUM'))
 if version_num < 1100000:
-    sys.exit('ERROR: Python bindings of GDAL 1.10 or later required')
+    raise Exception('ERROR: Python bindings of GDAL 1.10 or later required')
+    #sys.exit('ERROR: Python bindings of GDAL 1.10 or later required')
 
 # make sure gdal exceptions are not silent
 gdal.UseExceptions()
@@ -80,14 +83,22 @@ ogr.UseExceptions()
 
 logger = None
 
+# Prefix for imported temp tables
 PREFIX = 'temp_'
+# Prefix for snapshot tables
 SNAP = 'snap_'
+# Use the temp schema to create snapshots to test against (won't overwrite admin_bdys tables)
 TEST = True
+# Create and delete the import schema for each run
 CLEAN = True
+# Holds dataabse connection instances
 SELECTION = {'ogr':None,'psy':None}
+# Number of query attempts to make
+DEPTH = 5
 
-# translate geometry to 0-360 longitude space
+
 def shift_geom ( geom ):
+    '''translate geometry to 0-360 longitude space'''
     if geom is None:
         return
     count = geom.GetGeometryCount()
@@ -104,8 +115,8 @@ def shift_geom ( geom ):
             geom.SetPoint( i, x, y, z )
     return
 
-#check is geometry ring is clockwise.
 def ring_is_clockwise(ring):
+    '''check is geometry ring is clockwise'''
     total = 0
     i = 0
     point_count = ring.GetPointCount()
@@ -117,8 +128,8 @@ def ring_is_clockwise(ring):
         pt1 = pt2
     return (total >= 0)
 
-# this is required because of a bug in OGR http://trac.osgeo.org/gdal/ticket/5538
 def fix_esri_polyon(geom):
+    '''this is required because of a bug in OGR http://trac.osgeo.org/gdal/ticket/5538'''
     polygons = []
     count = geom.GetGeometryCount()
     if count > 0:
@@ -140,6 +151,21 @@ def fix_esri_polyon(geom):
         new_geom = polygons.pop()
     return new_geom
 
+class DataValidator(object):
+    #DRAFT
+    def __init__(self,conf):
+        self.conf = conf
+        
+    def validateSpatial(self):
+        '''Validates using specific queries, spatial or otherwise eg select addressPointsWithinMeshblocks()'''
+        for f in self.conf.validation_spatial:
+            Processor.attempt(self.conf, f)
+            
+    def validateData(self):
+        '''Validates the ref data itself, eg enforcing meshblock code length'''
+        for f in self.conf.validation_data:
+            Processor.attempt(self.conf, f)
+
 class ColumnMapperError(Exception):pass
 class ColumnMapper(object):
     '''Acions the list of column mappings from conf file'''
@@ -155,7 +181,7 @@ class ColumnMapper(object):
         for attr in conf.__dict__:
             m = re.search('(\w+)_colmap',attr)
             if m: self.map[m.group(1)] = json.loads(getattr(conf,attr))
-
+            
     def action(self,section,tablename,action):
         '''Generate queries from the column map'''
         _test = self.map.has_key(section) and self.map[section].has_key(tablename) and self.map[section][tablename].has_key(action)
@@ -214,12 +240,16 @@ class DatabaseConn_psycopg2(object):
         self.pcur = self.pconn.cursor()
         
     def execute(self,q):
-        res = None
+        '''Execute query q and return success/failure determined by fail=any error except no results'''
+        res = True
         try:
             self.pcur.execute(q)
-            res = self.pcur.fetchone() or None
-        except Exception as e: DatabaseConnectionException('Database query error, {}'.format(e))
-            
+            res = self.pcur.rowcount or None
+        except psycopg2.ProgrammingError as pe: 
+            if pe.message=='no results to fetch': res = True
+            else: raise 
+        except Exception as e: 
+            raise DatabaseConnectionException('Database query error, {}'.format(e))
         #for now just check if row returned as success
         return bool(res)
     
@@ -227,7 +257,6 @@ class DatabaseConn_psycopg2(object):
         self.pconn.commit()
         self.pcur.close()
         self.pconn.close()
-
 
 class DatabaseConn_ogr(object):
     
@@ -238,7 +267,8 @@ class DatabaseConn_ogr(object):
         self.pg_drv = ogr.GetDriverByName('PostgreSQL')
         if self.pg_drv is None:
             logger.fatal('Could not load the OGR PostgreSQL driver')
-            sys.exit(1)
+            raise Exception('Could not load the OGR PostgreSQL driver')
+            #sys.exit(1)
         
         self.pg_uri = 'PG:dbname=' + conf.db_name
         if conf.db_host:
@@ -263,7 +293,8 @@ class DatabaseConn_ogr(object):
                     self.pg_ds.ExecuteSQL("SET ROLE " + self.conf.db_rolename)
         except Exception as e:
             logger.fatal("Can't open PG output database: " + str(e))
-            sys.exit(1)
+            raise
+            #sys.exit(1)
             
     def execute(self,q):
         return self.pg_ds.ExecuteSQL(q)
@@ -272,22 +303,25 @@ class DatabaseConn_ogr(object):
         del self.pg_ds
                    
 class ConfReader(object):
+    TEMP = 'temp'
     
     def __init__(self):
-        
+        #legacy, can remove most of this!
+        global logger
         usage = "usage: %prog config_file.ini"
-        parser = OptionParser(usage=usage)
-        (cmd_opt, args) = parser.parse_args()
+        oparser = OptionParser(usage=usage)
+        (cmd_opt, args) = oparser.parse_args()
            
         #if len(args) == 1:
         #    config_files = [args[0]]
         #else:
-        config_files = ['download_admin_bdys.ini']
+        self.config_files = ['download_admin_bdys.ini']
         
-        parser = SafeConfigParser()
-        found = parser.read(config_files)
+        self.parser = SafeConfigParser()
+        found = self.parser.read(self.config_files)
         if not found:
-            sys.exit('Could not load config ' + config_files[0] )
+            raise Exception('Could not load config ' + self.config_files[0] )
+            #sys.exit('Could not load config ' + config_files[0] )
         
         # set up logging
         logging.config.fileConfig(config_files[0], defaults={ 'hostname': socket.gethostname() })
@@ -306,43 +340,61 @@ class ConfReader(object):
         self.grid_res = 0.05
         self.shift_geometry = False
         
-        self.base_uri = parser.get('source', 'base_uri')
-        self.db_name = parser.get('database', 'name')
-        self.db_schema = parser.get('database', 'schema')
+        self.base_uri = self.parser.get('source', 'base_uri')
+        self.db_name = self.parser.get('database', 'name')
+        self.db_schema = self.parser.get('database', 'schema')
         
-        if parser.has_option('database', 'rolename'):
-            self.db_rolename = parser.get('database', 'rolename')
-        if parser.has_option('database', 'host'):
-            self.db_host = parser.get('database', 'host')
-        if parser.has_option('database', 'port'):
-            self.db_port = parser.get('database', 'port')
-        if parser.has_option('database', 'user'):
-            self.db_user = parser.get('database', 'user')
-        if parser.has_option('database', 'password'):
-            self.db_pass = parser.get('database', 'password')
+        if self.parser.has_option('database', 'rolename'):
+            self.db_rolename = self.parser.get('database', 'rolename')
+        if self.parser.has_option('database', 'host'):
+            self.db_host = self.parser.get('database', 'host')
+        if self.parser.has_option('database', 'port'):
+            self.db_port = self.parser.get('database', 'port')
+        if self.parser.has_option('database', 'user'):
+            self.db_user = self.parser.get('database', 'user')
+        if self.parser.has_option('database', 'password'):
+            self.db_pass = self.parser.get('database', 'password')
             
-        self.layer_name = parser.get('layer', 'name')
-        self.layer_geom_column = parser.get('layer', 'geom_column')
-        if parser.has_option('layer', 'output_srid'):
-            self.layer_output_srid = parser.getint('layer', 'output_srid')
-        if parser.has_option('layer', 'create_grid'):
-            self.create_grid = parser.getboolean('layer', 'create_grid')
-        if parser.has_option('layer', 'grid_res'):
-            self.grid_res = parser.getfloat('layer', 'grid_res')
-        if parser.has_option('layer', 'shift_geometry'):
-            self.shift_geometry = parser.getboolean('layer', 'shift_geometry')
+        self.layer_name = self.parser.get('layer', 'name')
+        self.layer_geom_column = self.parser.get('layer', 'geom_column')
+        if self.parser.has_option('layer', 'output_srid'):
+            self.layer_output_srid = self.parser.getint('layer', 'output_srid')
+        if self.parser.has_option('layer', 'create_grid'):
+            self.create_grid = self.parser.getboolean('layer', 'create_grid')
+        if self.parser.has_option('layer', 'grid_res'):
+            self.grid_res = self.parser.getfloat('layer', 'grid_res')
+        if self.parser.has_option('layer', 'shift_geometry'):
+            self.shift_geometry = self.parser.getboolean('layer', 'shift_geometry')
             
         #meshblocks
-        for section in ('connection','file','meshblock','nzlocalities','database'):
-            for option in parser.options(section): 
-                setattr(self,'{}_{}'.format(section,option),parser.get(section,option))
+        for section in ('connection','meshblock','nzlocalities','database'):
+            for option in self.parser.options(section): 
+                setattr(self,'{}_{}'.format(section,option),self.parser.get(section,option))
             
         # set up logging
-        global logger
         logging.config.fileConfig(config_files[0], defaults={ 'hostname': socket.gethostname() })
         logger = logging.getLogger()
     
         logger.info('Starting download TA boundaries')
+        
+    def save(self,name,data):
+        '''configparser save for interrupted processing jobs'''
+        if not self.parser.has_section(self.TEMP): 
+            self.parser.add_section(self.TEMP)
+        self.parser.set(self.TEMP,name,json.dumps(data))
+        
+    def read(self,name):
+        '''configparser save for interrupted processing jobs'''
+        rv = ()
+        if self.parser.has_section(self.TEMP) and self.parser.has_option(self.TEMP,name): 
+            rv = json.loads(self.parser.get(self.TEMP,name))
+            #if clean is set the data will be deleted after this read so delete the section/option to prevent attempted reread
+            if CLEAN: 
+                self.parser.remove_option(self.TEMP,name)
+                self.parser.remove_section(self.TEMP)
+                self.parser.write(self.config_files)
+        return rv
+        
     
 class ProcessorException(Exception):pass
 class Processor(object):
@@ -444,17 +496,23 @@ class Processor(object):
             for i in range(0, in_ldef.GetFieldCount()):
                 in_fdef = in_ldef.GetFieldDefn(i)
                 out_layer.CreateField(in_fdef)
-                
+        except RuntimeError as r:
+            #Version.rebuild(self.conf) If a problem occurs any previously created tables are deleted
+            logger.warn('Error creating layer {}, drop and rebuild. {}'.format(out_name,r))
+            q1 = 'drop table if exists {} cascade'.format(out_name)
+            Processor.attempt(self.conf, q1, select='psy')
+            return self.insertshp(in_layer)
         except Exception as e:
             logger.fatal('Can not create {} output table {}'.format(out_name,e))
-            sys.exit(1)
+            raise
+            #sys.exit(1)
             
         #insert features
         try:
             in_layer.ResetReading()
             in_feat = in_layer.GetNextFeature()
             out_ldef = out_layer.GetLayerDefn()
-            while in_feat:                
+            while in_feat:
                 out_feat = ogr.Feature(out_ldef)
                 for i in range(0, out_ldef.GetFieldCount()):
                     out_feat.SetField(out_ldef.GetFieldDefn(i).GetNameRef(), in_feat.GetField(i))
@@ -472,7 +530,8 @@ class Processor(object):
             
         except Exception as e:
             logger.fatal('Can not populate {} output table {}'.format(e))
-            sys.exit(1)
+            raise 
+            #sys.exit(1)
             
         return out_name
             
@@ -520,9 +579,8 @@ class Processor(object):
 
 
     @staticmethod
-    def attempt(conf,q,select='ogr',depth=2):
+    def attempt(conf,q,select='ogr',depth=DEPTH):
         '''Attempt connection using ogr or psycopg drivers creating temp connection if conn object not stored'''
-        att = 1
         m,r = None,None
         while depth>0:
             try:
@@ -536,7 +594,7 @@ class Processor(object):
                         m = conn.get(q)
                         return m
             except RuntimeError as r:
-                print 'Attempt {} using {} failed, {}'.format(att,select,m or r)
+                print 'Attempt {} using {} failed, {}'.format(DEPTH-depth+1,select,m or r)
                 #if re.search('table_version.ver_apply_table_differences',q) and Processor.nonOGR(conf,q,depth-1): return
                 return Processor.attempt(conf, q, Processor._next(select), depth-1)
         if r: raise r
@@ -600,8 +658,7 @@ class Meshblock(Processor):
             self.delete(mbfile)
         #self.db.disconnect()
         return tlist
-
-        
+     
 class NZLocalities(Processor):
     '''Exract and process the nz_localities file'''
     #NB new format, see nz_locality
@@ -623,14 +680,14 @@ class NZLocalities(Processor):
         if not pathlist: pathlist = '{}{}.shp'.format(self.conf.nzlocalities_filepath,self.conf.nzlocalities_filename)
         ds = self.driver.Open(pathlist,0)
         if ds:
-            
             nzlayer = ds.GetLayer(0)
             tname = self.layername(nzlayer)
             self.insertshp(nzlayer)
             self.mapcolumns(tname)
-            
             tlist += (tname,)
             ds.Destroy()
+        else:
+            raise ProcessorException('Unable to initialise data source {}'.format(pathlist))
         #self.db.disconnect()
         return tlist
         
@@ -655,14 +712,17 @@ class Version(object):
             SNAP = ''
             
         #self.db.connect()
-        if self.clean:
-            #self.db.pg_ds.ExecuteSQL('drop schema if exists {} cascade'.format(self.conf.database_schema))
-            #self.db.pg_ds.ExecuteSQL('create schema {}'.format(self.conf.database_schema))
-            q1 = 'drop schema {} cascade'.format(self.conf.database_schema)
-            q2 = 'create schema {}'.format(self.conf.database_schema)
-            Processor.attempt(self.conf, q1, select='psy')
-            Processor.attempt(self.conf, q2, select='psy')
-                    
+        if self.clean: self.rebuild(self.conf)
+               
+    @staticmethod     
+    def rebuild(conf):              
+        #self.db.pg_ds.ExecuteSQL('drop schema if exists {} cascade'.format(self.conf.database_schema))
+        #self.db.pg_ds.ExecuteSQL('create schema {}'.format(self.conf.database_schema))          
+        q1 = 'drop schema if exists {} cascade'.format(conf.database_schema)
+        q2 = 'create schema {}'.format(conf.database_schema)
+        Processor.attempt(conf, q1, select='psy')
+        Processor.attempt(conf, q2, select='psy')
+        
     def teardown(self):
         '''drop temp schema'''
         if self.clean: 
@@ -681,7 +741,7 @@ class Version(object):
         #return bool(self.db.pg_ds.ExecuteSQL(q).GetFeatureCount())
         return Processor.attempt(self.conf, q, select='psy')
         
-    def _testquery(self,original,snap,imported,pk,srid):
+    def _testquery(self,original,snap,imported,pk,geom,srid):
         '''Temp setup to create temporary tables without interfering with in-use admin_bdy tables'''
         q = []
         si = imported.split('.')
@@ -690,23 +750,23 @@ class Version(object):
             q.append('alter table {snap} add primary key ({pk})'.format(snap=snap,pk=pk))
         if not self._pktest(si[0],si[1]):
             q.append('alter table {imported} add primary key ({pk})'.format(imported=imported,pk=pk))
-        if srid:
-            q.append("select UpdateGeometrySRID('{schema}','{imported}', 'shape', {srid})".format(schema=si[0],imported=si[1],srid=srid))
-            q.append("update {imported} set shape = ST_Transform(shape::geometry,{srid}::integer)".format(imported=imported,srid=srid))
+        if geom and srid:
+            q.append("select UpdateGeometrySRID('{schema}','{imported}', '{geom}', {srid})".format(schema=si[0],imported=si[1],geom=geom,srid=srid))
+            q.append("update {imported} set shape = ST_Transform({geom}::geometry,{srid}::integer)".format(imported=imported,geom=geom,srid=srid))
         q.append("select table_version.ver_apply_table_differences('{snap}','{imported}','{pk}')".format(snap=snap,imported=imported,pk=pk))
         #for i in q: print i
         return q
         
-    def _query(self,original,snap,imported,pk,srid):
+    def _query(self,original,_,imported,pk,geom,srid):
         '''run table version apply diffs'''
         q = []
         si = imported.split('.')
-        q.append('select table_version.ver_apply_table_differences({},{},{})'.format(snap,imported,pk))
-        if self._pktest(si[0],si[1]):
+        if not self._pktest(si[0],si[1]):
             q.append('alter table {imported} add primary key ({pk})'.format(imported=imported,pk=pk))
-        q.append("select UpdateGeometrySRID('{schema}','{imported}', 'shape', {srid})".format(schema=si[0],imported=si[1],srid=srid))
-        q.append("update {imported} set shape = ST_Transform(shape::geometry,{srid}::integer)".format(imported=imported,srid=srid))
-        q.append("select table_version.ver_apply_table_differences('{original}','{imported}','{pk}')".format(snap=snap,imported=imported,pk=pk))
+        if geom and srid:
+            q.append("select UpdateGeometrySRID('{schema}','{imported}', '{geom}', {srid})".format(schema=si[0],imported=si[1],geom=geom,srid=srid))
+            q.append("update {imported} set {geom} = ST_Transform({geom}::geometry,{srid}::integer)".format(imported=imported,geom=geom,srid=srid))
+        q.append("select table_version.ver_apply_table_differences('{original}','{imported}','{pk}')".format(original=original,imported=imported,pk=pk))
         #for i in q: print i
         return q
         
@@ -716,15 +776,16 @@ class Version(object):
             for t in tab:
                 t2 = self.cm.map[sec][t]['table']
                 pk = self.cm.map[sec][t]['primary']
+                geom = self.cm.map[sec][t]['geom'] if self.cm.map[sec][t].has_key('geom') else None
                 srid = self.cm.map[sec][t]['srid'] if self.cm.map[sec][t].has_key('srid') else None
                 snap = '{}.{}{}'.format(self.conf.database_schema,SNAP,t)
-                original = '{}.{}'.format(self.conf.database_originschema,t2)
+                original = '{}.x_{}'.format(self.conf.database_originschema,t2)
                 imported = '{}.{}{}'.format(self.conf.database_schema,PREFIX,t)
-                for q in self.qset(original,snap,imported,pk,srid):
+                for q in self.qset(original,snap,imported,pk,geom,srid):
                     print 'pQ1',q
                     Processor.attempt(self.conf,q)
-                #
-                self.gridtables(sec,t,'{}{}'.format(SNAP,t))
+                dst_t = '{}{}'.format(SNAP,t) if TEST else 'x_{}'.format(t2)
+                self.gridtables(sec,t,dst_t)
                     
     def gridtables(self,sec,tab,tname):
         '''Look for grid specification and grid the table if found'''
@@ -740,20 +801,21 @@ class External(object):
         self.conf = conf
         
         
-    def build(self,tgt,colres):
+    def build(self,gridtable,colres):
         '''Create temp schema'''
         #self.db.connect()
         for file,query in self.externals:
-            schema,table = re.search('select ([a-zA-Z_\.]+)',query).group(1).split('.')
-            if not self._fnctest(schema, table):
+            schema,func = re.search('select ([a-zA-Z_\.]+)',query).group(1).split('.')
+            if not self._fnctest(schema, func):
                 with open(file,'r') as handle:
                     text = handle.read()
                 #self.db.pg_ds.ExecuteSQL(text)
                 Processor.attempt(self.conf,text)
             col = colres['geocol']
             res = colres['res']
-            q = query.format(schema=self.conf.database_schema, table=tgt, column=col, xres=res, yres=res)
-            #self.db.pg_ds.ExecuteSQL(q)
+            dstschema = self.conf.database_schema if TEST else self.conf.database_originschema
+            q = query.format(schema=dstschema, table=gridtable, column=col, xres=res, yres=res)
+            print 'eQ1',q
             Processor.attempt(self.conf,q)
         #self.db.disconnect()
             
@@ -765,9 +827,6 @@ class External(object):
         print 'fQ2',q
         return Processor.attempt(self.conf, q)
             
-        
-    
-    
 class PExpectException(Exception):pass
 class PExpectSFTP(object):  
       
@@ -819,7 +878,11 @@ class PExpectSFTP(object):
             
         return localpath
 
-    
+   
+def oneOrNone(a,options,args):
+    '''is A in args OR are none of the options in args'''
+    return a in args or not any([True for i in options if i in args]) 
+     
 '''
 TODO
 file name reader, db overwrite
@@ -842,26 +905,64 @@ def main():
         elif opt in ("-v", "--version"):
             print __version__
             sys.exit(0)
-
+            
+            
     c = ConfReader()
     m = ColumnMapper(c)
+
     global SELECTION
-    with DB(c,'ogr') as ogrdb:
-        SELECTION['ogr'] = ogrdb.d
-        #SELECTION['ogr'] = DatabaseConn_ogr(c)
-        s = PExpectSFTP(c)
-        v = Version(c,m,clean=CLEAN)
+    with DB(c,'ogr') as ogrdb:           
+        t = c.read('t') #if a t value is stored we dont want to pre-clean the import schema 
+        v = Version(c,m,clean=CLEAN and not bool(t))
         v.setup()
-        if len(args)==0 or 'm' in args:
-            mbk = Meshblock(c,SELECTION['ogr'],m,s)
-            t += (mbk.run(),)
-        if len(args)==0 or 'l' in args:
-            nzl = NZLocalities(c,SELECTION['ogr'],m,s) 
-            t += (nzl.run(),)
-        if not t: t = _t
-        print t
-        v.versiontables(t)
+        aopts = ('prepare','transfer')
+        if oneOrNone('prepare',aopts,args): # not args or 'prepare' in args:
+            '''fetch data from sources and prepare import schema'''
+            t = ()
+            SELECTION['ogr'] = ogrdb.d
+            #SELECTION['ogr'] = DatabaseConn_ogr(c)
+            s = PExpectSFTP(c)
+            if CLEAN:
+                topts = ('meshblock','nzlocalities')
+                if oneOrNone('meshblock',topts,args): # len(args)==0 or 'meshblock' in args:
+                    mbk = Meshblock(c,SELECTION['ogr'],m,s)
+                    t += (mbk.run(),)
+                if oneOrNone('nzlocalities',topts,args): # len(args)==0 or 'localities' in args:
+                    nzl = NZLocalities(c,SELECTION['ogr'],m,s) 
+                    t += (nzl.run(),)
+                c.save('t',t)
+            
+        if oneOrNone('transfer',aopts,args): # not args or 'transfer' in args:
+            '''if data has been validated transfer to final schema'''
+            #if not t: t = _t
+            print t
+            v.versiontables(t)
         v.teardown()
+        
+
+
+
+# Splitting import process for Addressing requirement of inspecting data before final commit
+#     c = ConfReader()
+#     m = ColumnMapper(c)
+#     global SELECTION
+#     with DB(c,'ogr') as ogrdb:
+#         SELECTION['ogr'] = ogrdb.d
+#         #SELECTION['ogr'] = DatabaseConn_ogr(c)
+#         s = PExpectSFTP(c)
+#         v = Version(c,m,clean=CLEAN)
+#         v.setup()
+#         if CLEAN:
+#             if len(args)==0 or 'm' in args:
+#                 mbk = Meshblock(c,SELECTION['ogr'],m,s)
+#                 t += (mbk.run(),)
+#             if len(args)==0 or 'l' in args:
+#                 nzl = NZLocalities(c,SELECTION['ogr'],m,s) 
+#                 t += (nzl.run(),)
+#         if not t: t = _t
+#         print t
+#         v.versiontables(t)
+#         v.teardown()
     
 if __name__ == "__main__":
     main()
