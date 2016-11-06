@@ -1,5 +1,7 @@
 #LINZ Download TA Boundaries
 
+THIS PROJECT HAS BEEN SUPERCEEDED BY https://github.com/linz/AdminBoundaries
+
 This LINZ software provides a script to download and update [Statistics New Zealand](http://www.stats.govt.nz/) Territorial Authority (TA) boundaries from the [Stats ArcGIS REST API service](http://maps.stats.govt.nz/wss/service/arcgis1/guest/) to a PostgreSQL/PostGIS Database. It optionally translates the downloads geometries to a coordinate system of your choice, translates the longitudes to 0-360 range, and builds a grid index which is suitable for fast intersect relationship tests.
 
 ## Configuration setup
